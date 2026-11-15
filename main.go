@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
-	"strings"
 	"regexp"
+	"strings"
 )
 
 // CheckRequest описывает входящий JSON от клиента
@@ -26,17 +26,26 @@ type CheckResult struct {
 	Reasons []string `json:"reasons"`
 }
 
+// Выносим регулярное выражение на уровень пакета, чтобы не компилировать его при каждом запросе
+var numericHostRegex = regexp.MustCompile(`^[0-9.]+$`)
+
+// Список популярных составных доменных зон
+var multiPartTLDs = []string{".co.uk", ".org.uk", ".gov.uk", ".com.au", ".net.au", ".org.ru", ".net.ru", ".com.ru"}
+
 func analyzeURL(rawURL string) CheckResult {
 	res := CheckResult{
 		URL:     rawURL,
-		Reasons: []string{}, // Инициализируем пустой срез, чтобы в JSON был [], а не null
+		Reasons: []string{},
 	}
 
-	if !strings.HasPrefix(rawURL, "http://") && !strings.HasPrefix(rawURL, "https://") {
-		rawURL = "http://" + rawURL
+	// 1. Проверяем, указал ли пользователь протокол явно
+	hasExplicitScheme := strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://")
+	urlToParse := rawURL
+	if !hasExplicitScheme {
+		urlToParse = "http://" + rawURL
 	}
 
-	parsed, err := url.Parse(rawURL)
+	parsed, err := url.Parse(urlToParse)
 	if err != nil || parsed.Host == "" {
 		res.IsPhish = true
 		res.Score = 100
@@ -44,44 +53,66 @@ func analyzeURL(rawURL string) CheckResult {
 		return res
 	}
 
-	host := parsed.Hostname()
+	host := strings.ToLower(parsed.Hostname())
 
-	if parsed.Scheme != "https" {
-		res.Score += 20
-		res.Reasons = append(res.Reasons, "Отсутствует шифрование HTTPS.")
+	// Штрафуем за HTTP только если пользователь явно ввел http://
+	if hasExplicitScheme && parsed.Scheme == "http" {
+		res.Score += 15
+		res.Reasons = append(res.Reasons, "Используется незащищенный протокол HTTP.")
 	}
 
-	isNumericHost, _ := regexp.MatchString(`^[0-9.]+$`, host)
-	if net.ParseIP(host) != nil || isNumericHost {
-		res.Score += 40
+	// Проверка на IP-адрес (поддерживает и IPv4, и IPv6)
+	if net.ParseIP(host) != nil || numericHostRegex.MatchString(host) {
+		res.Score += 45
 		res.Reasons = append(res.Reasons, "Вместо доменного имени используется IP-адрес или числовой формат.")
 	}
 
+	// Проверка на Punycode (IDN-атаки с подменой символов)
 	if strings.Contains(host, "xn--") {
 		res.Score += 35
 		res.Reasons = append(res.Reasons, "Обнаружен Punycode (возможна подмена букв на похожие символы).")
 	}
 
-	if strings.Contains(rawURL, "@") {
-		res.Score += 40
-		res.Reasons = append(res.Reasons, "Ссылка содержит символ '@', который может скрывать реальный домен.")
+	// 2. Проверяем наличие логина/пароля (символа '@') только в части Userinfo, а не во всей ссылке
+	if parsed.User != nil {
+		res.Score += 45
+		res.Reasons = append(res.Reasons, "Ссылка содержит учетные данные перед символом '@', что часто используется для маскировки реального домена.")
 	}
 
-	parts := strings.Split(host, ".")
+	// 3. Корректный подсчет поддоменов с учетом составных доменных зон
+	cleanHost := strings.TrimPrefix(host, "www.")
+	effectiveHost := cleanHost
+	for _, tld := range multiPartTLDs {
+		if strings.HasSuffix(cleanHost, tld) {
+			// Заменяем составную зону на условный одноуровневый домен для точного подсчета
+			effectiveHost = strings.TrimSuffix(cleanHost, tld) + ".tld"
+			break
+		}
+	}
+
+	parts := strings.Split(effectiveHost, ".")
+	// Если частей больше 3 (например, ://domain.com), значит поддоменов 2 и более
 	if len(parts) > 3 {
 		res.Score += 20
 		res.Reasons = append(res.Reasons, "Подозрительно большое количество поддоменов.")
 	}
 
+	// Проверка ключевых слов (ограничиваем максимальный штраф за слова, чтобы избежать перекоса)
 	keywords := []string{"login", "verify", "update", "secure", "account", "bank", "free"}
+	keywordScore := 0
 	for _, kw := range keywords {
-		if strings.Contains(strings.ToLower(host), kw) {
-			res.Score += 15
+		if strings.Contains(host, kw) {
+			keywordScore += 15
 			res.Reasons = append(res.Reasons, fmt.Sprintf("В домене найдено ключевое слово '%s'.", kw))
 		}
 	}
+	if keywordScore > 30 {
+		keywordScore = 30
+	}
+	res.Score += keywordScore
 
-	if res.Score >= 40 {
+	// 4. Повышенный порог срабатывания (60 баллов вместо 40) для снижения ложных срабатываний
+	if res.Score >= 60 {
 		res.IsPhish = true
 	}
 	if res.Score > 100 {
@@ -91,7 +122,7 @@ func analyzeURL(rawURL string) CheckResult {
 	return res
 }
 
-// indexHandler просто отдает статическую HTML-страницу
+// indexHandler отдает статическую HTML-страницу
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	tmplPath := filepath.Join("templates", "index.html")
 	tmpl, err := template.ParseFiles(tmplPath)
