@@ -1,24 +1,28 @@
 package main
 
 import (
+	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"html/template"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 )
 
-// CheckRequest описывает входящий JSON от клиента
 type CheckRequest struct {
 	URL string `json:"url"`
 }
 
-// CheckResult описывает ответ сервера в формате JSON
 type CheckResult struct {
 	URL     string   `json:"url"`
 	IsPhish bool     `json:"is_phish"`
@@ -26,11 +30,202 @@ type CheckResult struct {
 	Reasons []string `json:"reasons"`
 }
 
-// Выносим регулярное выражение на уровень пакета, чтобы не компилировать его при каждом запросе
-var numericHostRegex = regexp.MustCompile(`^[0-9.]+$`)
+var (
+	numericHostRegex = regexp.MustCompile(`^[0-9.]+$`)
+	multiPartTLDs    = []string{".co.uk", ".org.uk", ".gov.uk", ".com.au", ".net.au", ".org.ru", ".net.ru", ".com.ru"}
+	suspiciousTLDs   = []string{".xyz", ".top", ".tk", ".ml", ".gq", ".cf", ".ga", ".zip", ".mov", ".icu"}
 
-// Список популярных составных доменных зон
-var multiPartTLDs = []string{".co.uk", ".org.uk", ".gov.uk", ".com.au", ".net.au", ".org.ru", ".net.ru", ".com.ru"}
+	urlShorteners = map[string]bool{
+		"bit.ly": true, "tinyurl.com": true, "clck.ru": true, "t.co": true,
+		"goo.gl": true, "is.gd": true, "vk.cc": true, "cutt.ly": true, "ow.ly": true,
+	}
+
+	// Зеркала для загрузки рейтинга Google CrUX
+	cruxMirrors = []string{
+		"https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/global/current.csv.gz",
+		"https://github.com",
+	}
+
+	trustedDomains = make(map[string]bool)
+	domainsMutex   sync.RWMutex
+)
+
+const (
+	cacheFile       = "trusted_domains_cache.txt"
+	topDomainsLimit = 50000
+)
+
+func initTrustedDomains() {
+	fallback := []string{
+		"google.com", "youtube.com", "facebook.com", "amazon.com", "wikipedia.org",
+		"twitter.com", "x.com", "instagram.com", "linkedin.com", "reddit.com",
+		"netflix.com", "microsoft.com", "apple.com", "github.com", "stackoverflow.com",
+		"yandex.ru", "vk.com", "mail.ru", "sberbank.ru", "tbank.ru", "gosuslugi.ru",
+	}
+	domainsMutex.Lock()
+	for _, d := range fallback {
+		trustedDomains[d] = true
+	}
+	domainsMutex.Unlock()
+
+	if info, err := os.Stat(cacheFile); err == nil && time.Since(info.ModTime()) < 7*24*time.Hour {
+		if loadDomainsFromFile(cacheFile) == nil {
+			log.Printf("Загружено %d мировых доменов из локального кэша", len(trustedDomains))
+			return
+		}
+	}
+
+	go func() {
+		log.Println("Загрузка мирового рейтинга доменов (Google CrUX)...")
+		if err := downloadAndCacheDomains(); err != nil {
+			log.Printf("Не удалось обновить мировой список доменов (используется базовый): %v", err)
+			return
+		}
+		log.Printf("Успешно загружено %d мировых доменов в белый список", len(trustedDomains))
+	}()
+}
+
+func downloadAndCacheDomains() error {
+	var lastErr error
+	for _, mirrorURL := range cruxMirrors {
+		if err := fetchFromURL(mirrorURL); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+func fetchFromURL(targetURL string) error {
+	client := &http.Client{Timeout: 30 * time.Second}
+	req, err := http.NewRequest("GET", targetURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PhishDetector/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("сервер вернул статус %d для %s", resp.StatusCode, targetURL)
+	}
+
+	gzReader, err := gzip.NewReader(resp.Body)
+	if err != nil {
+		return fmt.Errorf("ошибка распаковки GZIP: %v", err)
+	}
+	defer gzReader.Close()
+
+	newMap := make(map[string]bool, topDomainsLimit)
+	var linesToCache []string
+
+	scanner := bufio.NewScanner(gzReader)
+	count := 0
+	isHeader := true
+
+	for scanner.Scan() && count < topDomainsLimit {
+		line := scanner.Text()
+		if isHeader {
+			isHeader = false
+			continue
+		}
+
+		// Извлекаем первую колонку до запятой (например, "https://google.com")
+		rawOrigin, _, found := strings.Cut(line, ",")
+		if !found {
+			continue
+		}
+
+		parsed, err := url.Parse(strings.TrimSpace(strings.ToLower(rawOrigin)))
+		if err != nil || parsed.Hostname() == "" {
+			continue
+		}
+
+		rootDomain := getRootDomain(parsed.Hostname())
+		if rootDomain != "" && !urlShorteners[rootDomain] && !newMap[rootDomain] {
+			newMap[rootDomain] = true
+			linesToCache = append(linesToCache, rootDomain)
+			count++
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	domainsMutex.Lock()
+	for k, v := range newMap {
+		trustedDomains[k] = v
+	}
+	domainsMutex.Unlock()
+
+	_ = os.WriteFile(cacheFile, []byte(strings.Join(linesToCache, "\n")), 0644)
+	return nil
+}
+
+func loadDomainsFromFile(filename string) error {
+	file, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	domainsMutex.Lock()
+	defer domainsMutex.Unlock()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		domain := strings.TrimSpace(scanner.Text())
+		if domain != "" && !urlShorteners[domain] {
+			trustedDomains[domain] = true
+		}
+	}
+	return scanner.Err()
+}
+
+func isTrustedDomain(domain string) bool {
+	domainsMutex.RLock()
+	defer domainsMutex.RUnlock()
+	return trustedDomains[domain]
+}
+
+func calculateEntropy(s string) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	freq := make(map[rune]float64)
+	for _, char := range s {
+		freq[char]++
+	}
+	var entropy float64
+	length := float64(len([]rune(s)))
+	for _, count := range freq {
+		p := count / length
+		entropy -= p * math.Log2(p)
+	}
+	return entropy
+}
+
+func getRootDomain(host string) string {
+	cleanHost := strings.TrimPrefix(host, "www.")
+	for _, tld := range multiPartTLDs {
+		if strings.HasSuffix(cleanHost, tld) {
+			withoutTLD := strings.TrimSuffix(cleanHost, tld)
+			parts := strings.Split(withoutTLD, ".")
+			return parts[len(parts)-1] + tld
+		}
+	}
+	parts := strings.Split(cleanHost, ".")
+	if len(parts) >= 2 {
+		return parts[len(parts)-2] + "." + parts[len(parts)-1]
+	}
+	return cleanHost
+}
 
 func analyzeURL(rawURL string) CheckResult {
 	res := CheckResult{
@@ -38,7 +233,6 @@ func analyzeURL(rawURL string) CheckResult {
 		Reasons: []string{},
 	}
 
-	// 1. Проверяем, указал ли пользователь протокол явно
 	hasExplicitScheme := strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://")
 	urlToParse := rawURL
 	if !hasExplicitScheme {
@@ -54,50 +248,77 @@ func analyzeURL(rawURL string) CheckResult {
 	}
 
 	host := strings.ToLower(parsed.Hostname())
+	rootDomain := getRootDomain(host)
 
-	// Штрафуем за HTTP только если пользователь явно ввел http://
+	if parsed.User == nil && isTrustedDomain(rootDomain) {
+		res.IsPhish = false
+		res.Score = 0
+		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' входит в мировой рейтинг доверенных сайтов.", rootDomain))
+		return res
+	}
+
+	if urlShorteners[rootDomain] {
+		res.Score += 30
+		res.Reasons = append(res.Reasons, fmt.Sprintf("Используется сервис сокращения ссылок (%s), скрывающий конечный адрес.", rootDomain))
+	}
+
 	if hasExplicitScheme && parsed.Scheme == "http" {
 		res.Score += 15
 		res.Reasons = append(res.Reasons, "Используется незащищенный протокол HTTP.")
 	}
 
-	// Проверка на IP-адрес (поддерживает и IPv4, и IPv6)
 	if net.ParseIP(host) != nil || numericHostRegex.MatchString(host) {
 		res.Score += 45
 		res.Reasons = append(res.Reasons, "Вместо доменного имени используется IP-адрес или числовой формат.")
 	}
 
-	// Проверка на Punycode (IDN-атаки с подменой символов)
 	if strings.Contains(host, "xn--") {
 		res.Score += 35
 		res.Reasons = append(res.Reasons, "Обнаружен Punycode (возможна подмена букв на похожие символы).")
 	}
 
-	// 2. Проверяем наличие логина/пароля (символа '@') только в части Userinfo, а не во всей ссылке
 	if parsed.User != nil {
 		res.Score += 45
-		res.Reasons = append(res.Reasons, "Ссылка содержит учетные данные перед символом '@', что часто используется для маскировки реального домена.")
+		res.Reasons = append(res.Reasons, "Ссылка содержит учетные данные перед символом '@', маскирующие реальный домен.")
 	}
 
-	// 3. Корректный подсчет поддоменов с учетом составных доменных зон
-	cleanHost := strings.TrimPrefix(host, "www.")
-	effectiveHost := cleanHost
-	for _, tld := range multiPartTLDs {
-		if strings.HasSuffix(cleanHost, tld) {
-			// Заменяем составную зону на условный одноуровневый домен для точного подсчета
-			effectiveHost = strings.TrimSuffix(cleanHost, tld) + ".tld"
+	for _, tld := range suspiciousTLDs {
+		if strings.HasSuffix(host, tld) {
+			res.Score += 25
+			res.Reasons = append(res.Reasons, fmt.Sprintf("Используется доменная зона повышенного риска (%s).", tld))
 			break
 		}
 	}
 
-	parts := strings.Split(effectiveHost, ".")
-	// Если частей больше 3 (например, ://domain.com), значит поддоменов 2 и более
-	if len(parts) > 3 {
+	if len(rawURL) > 75 {
+		res.Score += 15
+		res.Reasons = append(res.Reasons, "Подозрительно длинный URL-адрес (более 75 символов).")
+	}
+
+	if strings.Count(host, "-") >= 3 {
+		res.Score += 20
+		res.Reasons = append(res.Reasons, "Чрезмерное количество дефисов в доменном имени.")
+	}
+
+	domainLabel, _, _ := strings.Cut(rootDomain, ".")
+	if len(domainLabel) > 10 && calculateEntropy(domainLabel) > 3.8 {
+		res.Score += 20
+		res.Reasons = append(res.Reasons, "Высокая энтропия домена (имя похоже на случайно сгенерированный набор символов).")
+	}
+
+	cleanHost := strings.TrimPrefix(host, "www.")
+	effectiveHost := cleanHost
+	for _, tld := range multiPartTLDs {
+		if strings.HasSuffix(cleanHost, tld) {
+			effectiveHost = strings.TrimSuffix(cleanHost, tld) + ".tld"
+			break
+		}
+	}
+	if len(strings.Split(effectiveHost, ".")) > 3 {
 		res.Score += 20
 		res.Reasons = append(res.Reasons, "Подозрительно большое количество поддоменов.")
 	}
 
-	// Проверка ключевых слов (ограничиваем максимальный штраф за слова, чтобы избежать перекоса)
 	keywords := []string{"login", "verify", "update", "secure", "account", "bank", "free"}
 	keywordScore := 0
 	for _, kw := range keywords {
@@ -111,7 +332,6 @@ func analyzeURL(rawURL string) CheckResult {
 	}
 	res.Score += keywordScore
 
-	// 4. Повышенный порог срабатывания (60 баллов вместо 40) для снижения ложных срабатываний
 	if res.Score >= 60 {
 		res.IsPhish = true
 	}
@@ -122,7 +342,6 @@ func analyzeURL(rawURL string) CheckResult {
 	return res
 }
 
-// indexHandler отдает статическую HTML-страницу
 func indexHandler(w http.ResponseWriter, r *http.Request) {
 	tmplPath := filepath.Join("templates", "index.html")
 	tmpl, err := template.ParseFiles(tmplPath)
@@ -133,7 +352,6 @@ func indexHandler(w http.ResponseWriter, r *http.Request) {
 	tmpl.Execute(w, nil)
 }
 
-// apiCheckHandler принимает JSON и возвращает результат в JSON
 func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
@@ -159,6 +377,8 @@ func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	initTrustedDomains()
+
 	http.HandleFunc("/", indexHandler)
 	http.HandleFunc("/api/check", apiCheckHandler)
 
