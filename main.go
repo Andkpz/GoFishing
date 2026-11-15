@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -30,6 +31,12 @@ type CheckResult struct {
 	Reasons []string `json:"reasons"`
 }
 
+type sslCacheEntry struct {
+	score     int
+	reasons   []string
+	checkedAt time.Time
+}
+
 var (
 	numericHostRegex = regexp.MustCompile(`^[0-9.]+$`)
 	multiPartTLDs    = []string{".co.uk", ".org.uk", ".gov.uk", ".com.au", ".net.au", ".org.ru", ".net.ru", ".com.ru"}
@@ -40,19 +47,22 @@ var (
 		"goo.gl": true, "is.gd": true, "vk.cc": true, "cutt.ly": true, "ow.ly": true,
 	}
 
-	// Зеркала для загрузки рейтинга Google CrUX
 	cruxMirrors = []string{
-		"https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/global/current.csv.gz",
+		"https://githubusercontent.com",
 		"https://github.com",
 	}
 
 	trustedDomains = make(map[string]bool)
 	domainsMutex   sync.RWMutex
+
+	sslCache      = make(map[string]sslCacheEntry)
+	sslCacheMutex sync.RWMutex
 )
 
 const (
 	cacheFile       = "trusted_domains_cache.txt"
 	topDomainsLimit = 50000
+	sslCacheTTL     = 10 * time.Minute
 )
 
 func initTrustedDomains() {
@@ -135,7 +145,6 @@ func fetchFromURL(targetURL string) error {
 			continue
 		}
 
-		// Извлекаем первую колонку до запятой (например, "https://google.com")
 		rawOrigin, _, found := strings.Cut(line, ",")
 		if !found {
 			continue
@@ -227,6 +236,62 @@ func getRootDomain(host string) string {
 	return cleanHost
 }
 
+func checkSSL(host string) (int, []string) {
+	if net.ParseIP(host) != nil {
+		return 0, nil
+	}
+
+	sslCacheMutex.RLock()
+	if cached, exists := sslCache[host]; exists && time.Since(cached.checkedAt) < sslCacheTTL {
+		sslCacheMutex.RUnlock()
+		return cached.score, cached.reasons
+	}
+	sslCacheMutex.RUnlock()
+
+	var score int
+	var reasons []string
+
+	dialer := &net.Dialer{Timeout: 4 * time.Second}
+	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, "443"), &tls.Config{
+		ServerName: host,
+	})
+
+	if err != nil {
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			score += 15
+			reasons = append(reasons, "Таймаут SSL-проверки: сервер слишком долго не отвечает по порту 443.")
+		} else {
+			score += 30
+			reasons = append(reasons, fmt.Sprintf("Ошибка SSL/TLS: %v", err))
+		}
+	} else {
+		defer conn.Close()
+		certs := conn.ConnectionState().PeerCertificates
+		if len(certs) > 0 {
+			leaf := certs[0]
+
+			if time.Since(leaf.NotBefore) < 7*24*time.Hour {
+				score += 15
+				reasons = append(reasons, fmt.Sprintf("SSL-сертификат выпущен совсем недавно (%s) — частый признак однодневного фишинга.", leaf.NotBefore.Format("02.01.2006")))
+			}
+
+			if time.Until(leaf.NotAfter) < 3*24*time.Hour {
+				score += 10
+				reasons = append(reasons, "Срок действия SSL-сертификата истекает менее чем через 3 дня.")
+			}
+		}
+	}
+
+	sslCacheMutex.Lock()
+	sslCache[host] = sslCacheEntry{
+		score:     score,
+		reasons:   reasons,
+		checkedAt: time.Now(),
+	}
+	sslCacheMutex.Unlock()
+
+	return score, reasons
+}
 func analyzeURL(rawURL string) CheckResult {
 	res := CheckResult{
 		URL:     rawURL,
@@ -331,6 +396,12 @@ func analyzeURL(rawURL string) CheckResult {
 		keywordScore = 30
 	}
 	res.Score += keywordScore
+
+	if !urlShorteners[rootDomain] && res.Score < 100 {
+		sslScore, sslReasons := checkSSL(host)
+		res.Score += sslScore
+		res.Reasons = append(res.Reasons, sslReasons...)
+	}
 
 	if res.Score >= 60 {
 		res.IsPhish = true
