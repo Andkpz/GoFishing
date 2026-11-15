@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Проверка ссылки на фишинг</title>
+    <style>
+        body { font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 0 20px; line-height: 1.5; }
+        form { display: flex; gap: 10px; }
+        input[type="text"] { flex: 1; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; }
+        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
+        button:hover { background-color: #0056b3; }
+        .result { margin-top: 20px; padding: 15px; border-radius: 5px; display: none; }
+        .safe { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
+        .danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+    </style>
+</head>
+<body>
+    <h2>Детектор фишинговых ссылок</h2>
+    <form id="checkForm">
+        <input type="text" id="urlInput" placeholder="https://example.com" required>
+        <button type="submit">Проверить</button>
+    </form>
+
+    <div id="resultBox" class="result"></div>
+
+    <script>
+        document.getElementById('checkForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            
+            const urlValue = document.getElementById('urlInput').value.trim();
+            const resultBox = document.getElementById('resultBox');
+
+            try {
+                const response = await fetch('/api/check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url: urlValue })
+                });
+
+                if (!response.ok) {
+                    throw new Error('Ошибка сервера');
+                }
+
+                const data = await response.json();
+
+                // Определяем цвет блока в зависимости от оценки риска
+                let statusClass = 'safe';
+                if (data.score >= 40) {
+                    statusClass = 'danger';
+                } else if (data.score >= 20) {
+                    statusClass = 'warning';
+                }
+
+                resultBox.className = 'result ' + statusClass;
+                resultBox.style.display = 'block';
+
+                let reasonsHtml = '<p>Подозрительных признаков не обнаружено.</p>';
+                if (data.reasons && data.reasons.length > 0) {
+                    reasonsHtml = '<ul>' + data.reasons.map(r => `<li>${r}</li>`).join('') + '</ul>';
+                }
+
+                resultBox.innerHTML = `
+                    <h3>Результат для: ${data.url}</h3>
+                    <p><strong>Оценка риска:</strong> ${data.score} / 100</p>
+                    ${reasonsHtml}
+                `;
+            } catch (error) {
+                resultBox.className = 'result danger';
+                resultBox.style.display = 'block';
+                resultBox.innerHTML = '<p>Не удалось выполнить проверку. Попробуйте позже.</p>';
+            }
+        });
+    </script>
+</body>
+</html>
