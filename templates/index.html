@@ -5,73 +5,187 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Проверка ссылки на фишинг</title>
     <style>
-        body { font-family: sans-serif; max-width: 600px; margin: 50px auto; padding: 0 20px; line-height: 1.5; }
-        form { display: flex; gap: 10px; }
-        input[type="text"] { flex: 1; padding: 10px; font-size: 16px; border: 1px solid #ccc; border-radius: 4px; }
-        button { padding: 10px 20px; font-size: 16px; cursor: pointer; background-color: #007bff; color: white; border: none; border-radius: 4px; }
-        button:hover { background-color: #0056b3; }
-        .result { margin-top: 20px; padding: 15px; border-radius: 5px; display: none; }
-        .safe { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
-        .warning { background-color: #fff3cd; color: #856404; border: 1px solid #ffeeba; }
-        .danger { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            background-color: #f8f9fa;
+            display: flex;
+            justify-content: center;
+            padding-top: 80px;
+            margin: 0;
+        }
+        .container {
+            width: 100%;
+            max-width: 600px;
+            padding: 0 20px;
+        }
+        h1 {
+            font-size: 24px;
+            color: #212529;
+            margin-bottom: 20px;
+        }
+        .search-box {
+            display: flex;
+            gap: 10px;
+        }
+        input[type="text"] {
+            flex: 1;
+            padding: 12px 15px;
+            font-size: 16px;
+            border: 1px solid #ced4da;
+            border-radius: 6px;
+            outline: none;
+        }
+        input[type="text"]:focus {
+            border-color: #0d6efd;
+        }
+        button {
+            padding: 12px 24px;
+            font-size: 16px;
+            background-color: #0d6efd;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #0b5ed7;
+        }
+        button:disabled {
+            background-color: #6c757d;
+            cursor: not-allowed;
+        }
+        .loader {
+            display: none;
+            margin-top: 20px;
+            color: #495057;
+            font-size: 15px;
+        }
+        .result-box {
+            display: none;
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        .safe {
+            background-color: #d1e7dd;
+            color: #0f5132;
+            border: 1px solid #badbcc;
+        }
+        .danger {
+            background-color: #f8d7da;
+            color: #842029;
+            border: 1px solid #f5c2c7;
+        }
+        .result-title {
+            font-weight: bold;
+            font-size: 18px;
+            margin-bottom: 10px;
+            word-break: break-all;
+        }
+        .score {
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+        ul {
+            margin: 0;
+            padding-left: 20px;
+        }
+        li {
+            margin-bottom: 5px;
+        }
     </style>
 </head>
 <body>
-    <h2>Детектор фишинговых ссылок</h2>
-    <form id="checkForm">
-        <input type="text" id="urlInput" placeholder="https://example.com" required>
-        <button type="submit">Проверить</button>
-    </form>
+    <div class="container">
+        <h1>Детектор фишинговых ссылок</h1>
+        <div class="search-box">
+            <input type="text" id="urlInput" placeholder="Введите ссылку (например, https://example.com)" autocomplete="off">
+            <button id="checkBtn" onclick="checkURL()">Проверить</button>
+        </div>
 
-    <div id="resultBox" class="result"></div>
+        <div id="loader" class="loader">Проверка ссылки и SSL-сертификата...</div>
+
+        <div id="resultBox" class="result-box">
+            <div class="result-title" id="resultTitle"></div>
+            <div class="score" id="resultScore"></div>
+            <ul id="resultReasons"></ul>
+        </div>
+    </div>
 
     <script>
-        document.getElementById('checkForm').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            
-            const urlValue = document.getElementById('urlInput').value.trim();
-            const resultBox = document.getElementById('resultBox');
+        const urlInput = document.getElementById('urlInput');
+        const checkBtn = document.getElementById('checkBtn');
+        const loader = document.getElementById('loader');
+        const resultBox = document.getElementById('resultBox');
+        const resultTitle = document.getElementById('resultTitle');
+        const resultScore = document.getElementById('resultScore');
+        const resultReasons = document.getElementById('resultReasons');
+
+        urlInput.addEventListener('input', function() {
+            resultBox.style.display = 'none';
+            resultReasons.innerHTML = '';
+        });
+
+        urlInput.addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                checkURL();
+            }
+        });
+
+        async function checkURL() {
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            checkBtn.disabled = true;
+            resultBox.style.display = 'none';
+            loader.style.display = 'block';
 
             try {
                 const response = await fetch('/api/check', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: urlValue })
+                    body: JSON.stringify({ url: url })
                 });
 
                 if (!response.ok) {
-                    throw new Error('Ошибка сервера');
+                    throw new Error('Ошибка сервера: ' + response.status);
                 }
 
                 const data = await response.json();
-
-                // Определяем цвет блока в зависимости от оценки риска
-                let statusClass = 'safe';
-                if (data.score >= 40) {
-                    statusClass = 'danger';
-                } else if (data.score >= 20) {
-                    statusClass = 'warning';
-                }
-
-                resultBox.className = 'result ' + statusClass;
+                renderResult(data);
+            } catch (err) {
+                resultBox.className = 'result-box danger';
+                resultTitle.textContent = 'Ошибка проверки';
+                resultScore.textContent = '';
+                resultReasons.innerHTML = `<li>${err.message}</li>`;
                 resultBox.style.display = 'block';
-
-                let reasonsHtml = '<p>Подозрительных признаков не обнаружено.</p>';
-                if (data.reasons && data.reasons.length > 0) {
-                    reasonsHtml = '<ul>' + data.reasons.map(r => `<li>${r}</li>`).join('') + '</ul>';
-                }
-
-                resultBox.innerHTML = `
-                    <h3>Результат для: ${data.url}</h3>
-                    <p><strong>Оценка риска:</strong> ${data.score} / 100</p>
-                    ${reasonsHtml}
-                `;
-            } catch (error) {
-                resultBox.className = 'result danger';
-                resultBox.style.display = 'block';
-                resultBox.innerHTML = '<p>Не удалось выполнить проверку. Попробуйте позже.</p>';
+            } finally {
+                checkBtn.disabled = false;
+                loader.style.display = 'none';
             }
-        });
+        }
+
+        function renderResult(data) {
+            resultBox.className = 'result-box ' + (data.is_phish ? 'danger' : 'safe');
+            resultTitle.textContent = (data.is_phish ? '⚠️ Обнаружен высокий риск фишинга: ' : '✅ Результат для: ') + data.url;
+            resultScore.textContent = `Оценка риска: ${data.score} / 100`;
+
+            resultReasons.innerHTML = '';
+            if (data.reasons && data.reasons.length > 0) {
+                data.reasons.forEach(reason => {
+                    const li = document.createElement('li');
+                    li.textContent = reason;
+                    resultReasons.appendChild(li);
+                });
+            } else {
+                const li = document.createElement('li');
+                li.textContent = 'Подозрительных признаков не обнаружено.';
+                resultReasons.appendChild(li);
+            }
+
+            resultBox.style.display = 'block';
+        }
     </script>
 </body>
 </html>
