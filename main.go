@@ -48,7 +48,7 @@ var (
 	}
 
 	cruxMirrors = []string{
-		"https://githubusercontent.com",
+		"https://github.com/zakird/crux-top-lists/raw/main/data/country/ru/202104.csv.gz",
 		"https://github.com",
 	}
 
@@ -294,15 +294,24 @@ func checkSSL(host string) (int, []string) {
 }
 
 func analyzeURL(rawURL string) CheckResult {
+	cleanURL := strings.TrimSpace(rawURL)
 	res := CheckResult{
-		URL:     rawURL,
+		URL:     cleanURL,
 		Reasons: []string{},
 	}
 
-	hasExplicitScheme := strings.HasPrefix(rawURL, "http://") || strings.HasPrefix(rawURL, "https://")
-	urlToParse := rawURL
+	if cleanURL == "" {
+		res.IsPhish = true
+		res.Score = 100
+		res.Reasons = append(res.Reasons, "Пустой URL-адрес.")
+		return res
+	}
+
+	lowerURL := strings.ToLower(cleanURL)
+	hasExplicitScheme := strings.HasPrefix(lowerURL, "http://") || strings.HasPrefix(lowerURL, "https://")
+	urlToParse := cleanURL
 	if !hasExplicitScheme {
-		urlToParse = "http://" + rawURL
+		urlToParse = "http://" + cleanURL
 	}
 
 	parsed, err := url.Parse(urlToParse)
@@ -315,8 +324,12 @@ func analyzeURL(rawURL string) CheckResult {
 
 	host := strings.ToLower(parsed.Hostname())
 	rootDomain := getRootDomain(host)
+	isIP := net.ParseIP(host) != nil || numericHostRegex.MatchString(host)
 
-	if parsed.User == nil && isTrustedDomain(rootDomain) {
+	beforeQuery, _, _ := strings.Cut(lowerURL, "?")
+	hasAtTrick := parsed.User != nil || strings.Contains(beforeQuery, "@") || strings.Contains(beforeQuery, "%40")
+
+	if !hasAtTrick && !isIP && isTrustedDomain(rootDomain) {
 		res.IsPhish = false
 		res.Score = 0
 		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' входит в мировой рейтинг доверенных сайтов.", rootDomain))
@@ -333,7 +346,7 @@ func analyzeURL(rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Используется незащищенный протокол HTTP.")
 	}
 
-	if net.ParseIP(host) != nil || numericHostRegex.MatchString(host) {
+	if isIP {
 		res.Score += 45
 		res.Reasons = append(res.Reasons, "Вместо доменного имени используется IP-адрес или числовой формат.")
 	}
@@ -343,9 +356,9 @@ func analyzeURL(rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Обнаружен Punycode (возможна подмена букв на похожие символы).")
 	}
 
-	if parsed.User != nil {
+	if hasAtTrick {
 		res.Score += 45
-		res.Reasons = append(res.Reasons, "Ссылка содержит учетные данные перед символом '@', маскирующие реальный домен.")
+		res.Reasons = append(res.Reasons, "Ссылка содержит символ '@' (или '%40') до параметров, маскирующий реальный адрес.")
 	}
 
 	for _, tld := range suspiciousTLDs {
@@ -356,7 +369,7 @@ func analyzeURL(rawURL string) CheckResult {
 		}
 	}
 
-	if len(rawURL) > 75 {
+	if len(cleanURL) > 75 {
 		res.Score += 15
 		res.Reasons = append(res.Reasons, "Подозрительно длинный URL-адрес (более 75 символов).")
 	}
@@ -398,7 +411,7 @@ func analyzeURL(rawURL string) CheckResult {
 	}
 	res.Score += keywordScore
 
-	if !urlShorteners[rootDomain] && res.Score < 100 {
+	if !isIP && !urlShorteners[rootDomain] && res.Score < 100 {
 		sslScore, sslReasons := checkSSL(host)
 		res.Score += sslScore
 		res.Reasons = append(res.Reasons, sslReasons...)
