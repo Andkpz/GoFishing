@@ -47,8 +47,38 @@ var (
 		"goo.gl": true, "is.gd": true, "vk.cc": true, "cutt.ly": true, "ow.ly": true,
 	}
 
+	protectedBrands = map[string]string{
+		"google":      "Google",
+		"youtube":     "YouTube",
+		"facebook":    "Facebook",
+		"amazon":      "Amazon",
+		"instagram":   "Instagram",
+		"linkedin":    "LinkedIn",
+		"netflix":     "Netflix",
+		"microsoft":   "Microsoft",
+		"apple":       "Apple",
+		"github":      "GitHub",
+		"paypal":      "PayPal",
+		"telegram":    "Telegram",
+		"whatsapp":    "WhatsApp",
+		"yandex":      "Яндекс",
+		"sberbank":    "Сбербанк",
+		"sber":        "Сбер",
+		"tbank":       "Т-Банк",
+		"tinkoff":     "Тинькофф",
+		"vtb":         "ВТБ",
+		"alfabank":    "Альфа-Банк",
+		"gazprombank": "Газпромбанк",
+		"gosuslugi":   "Госуслуги",
+		"nalog":       "ФНС России",
+		"wildberries": "Wildberries",
+		"ozon":        "Ozon",
+		"avito":       "Авито",
+		"mail":        "Mail.ru",
+	}
+
 	cruxMirrors = []string{
-		"https://github.com/zakird/crux-top-lists/raw/main/data/country/ru/202104.csv.gz",
+		"https://github.com",
 		"https://github.com",
 	}
 
@@ -64,7 +94,6 @@ const (
 	topDomainsLimit = 50000
 	sslCacheTTL     = 10 * time.Minute
 )
-
 func initTrustedDomains() {
 	fallback := []string{
 		"google.com", "youtube.com", "facebook.com", "amazon.com", "wikipedia.org",
@@ -202,7 +231,6 @@ func isTrustedDomain(domain string) bool {
 	defer domainsMutex.RUnlock()
 	return trustedDomains[domain]
 }
-
 func calculateEntropy(s string) float64 {
 	if len(s) == 0 {
 		return 0
@@ -234,6 +262,70 @@ func getRootDomain(host string) string {
 		return parts[len(parts)-2] + "." + parts[len(parts)-1]
 	}
 	return cleanHost
+}
+
+func levenshteinDistance(a, b string) int {
+	r1, r2 := []rune(a), []rune(b)
+	n, m := len(r1), len(r2)
+	if n == 0 {
+		return m
+	}
+	if m == 0 {
+		return n
+	}
+
+	prev := make([]int, m+1)
+	curr := make([]int, m+1)
+	for j := 0; j <= m; j++ {
+		prev[j] = j
+	}
+
+	for i := 1; i <= n; i++ {
+		curr[0] = i
+		for j := 1; j <= m; j++ {
+			cost := 0
+			if r1[i-1] != r2[j-1] {
+				cost = 1
+			}
+			del := prev[j] + 1
+			ins := curr[j-1] + 1
+			sub := prev[j-1] + cost
+
+			minVal := del
+			if ins < minVal {
+				minVal = ins
+			}
+			if sub < minVal {
+				minVal = sub
+			}
+			curr[j] = minVal
+		}
+		prev, curr = curr, prev
+	}
+	return prev[m]
+}
+
+func checkTyposquatting(domainLabel string) (int, string) {
+	if len(domainLabel) < 3 {
+		return 0, ""
+	}
+
+	for brandKey, brandName := range protectedBrands {
+		if domainLabel == brandKey {
+			continue
+		}
+
+		maxDist := 1
+		if len([]rune(brandKey)) >= 7 {
+			maxDist = 2
+		}
+
+		dist := levenshteinDistance(domainLabel, brandKey)
+		if dist > 0 && dist <= maxDist {
+			return 55, fmt.Sprintf("Возможный тайпсквоттинг: домен '%s' подозрительно похож на бренд %s (разница в %d симв.).", domainLabel, brandName, dist)
+		}
+	}
+	return 0, ""
 }
 
 func checkSSL(host string) (int, []string) {
@@ -292,7 +384,6 @@ func checkSSL(host string) (int, []string) {
 
 	return score, reasons
 }
-
 func analyzeURL(rawURL string) CheckResult {
 	cleanURL := strings.TrimSpace(rawURL)
 	res := CheckResult{
@@ -334,6 +425,14 @@ func analyzeURL(rawURL string) CheckResult {
 		res.Score = 0
 		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' входит в мировой рейтинг доверенных сайтов.", rootDomain))
 		return res
+	}
+
+	domainLabel, _, _ := strings.Cut(rootDomain, ".")
+	if !isIP && !urlShorteners[rootDomain] {
+		if typoScore, typoReason := checkTyposquatting(domainLabel); typoScore > 0 {
+			res.Score += typoScore
+			res.Reasons = append(res.Reasons, typoReason)
+		}
 	}
 
 	if urlShorteners[rootDomain] {
@@ -379,7 +478,6 @@ func analyzeURL(rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Чрезмерное количество дефисов в доменном имени.")
 	}
 
-	domainLabel, _, _ := strings.Cut(rootDomain, ".")
 	if len(domainLabel) > 10 && calculateEntropy(domainLabel) > 3.8 {
 		res.Score += 20
 		res.Reasons = append(res.Reasons, "Высокая энтропия домена (имя похоже на случайно сгенерированный набор символов).")
