@@ -3,7 +3,7 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
-	"crypto/tls"
+	"context"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -25,16 +25,14 @@ type CheckRequest struct {
 }
 
 type CheckResult struct {
-	URL     string   `json:"url"`
-	IsPhish bool     `json:"is_phish"`
-	Score   int      `json:"score"`
-	Reasons []string `json:"reasons"`
-}
-
-type sslCacheEntry struct {
-	score     int
-	reasons   []string
-	checkedAt time.Time
+	URL         string     `json:"url"`
+	IsPhish     bool       `json:"is_phish"`
+	Score       int        `json:"score"`
+	Reasons     []string   `json:"reasons"`
+	Domain      string     `json:"domain,omitempty"`
+	SSLStatus   string     `json:"ssl_status,omitempty"`
+	SSL         *SSLReport `json:"ssl,omitempty"`
+	WhoisStatus string     `json:"whois_status,omitempty"`
 }
 
 var (
@@ -45,6 +43,9 @@ var (
 	urlShorteners = map[string]bool{
 		"bit.ly": true, "tinyurl.com": true, "clck.ru": true, "t.co": true,
 		"goo.gl": true, "is.gd": true, "vk.cc": true, "cutt.ly": true, "ow.ly": true,
+	}
+	untrustedPlatforms = map[string]bool{
+		"blogspot.com": true,
 	}
 
 	protectedBrands = map[string]string{
@@ -77,23 +78,23 @@ var (
 		"mail":        "Mail.ru",
 	}
 
+	// Оба зеркала — один и тот же файл, но разные хосты:
+	// github.com/.../raw/... отдаёт редирект, raw.githubusercontent.com — сразу тело.
 	cruxMirrors = []string{
-		"https://github.com",
-		"https://github.com",
+		"https://github.com/zakird/crux-top-lists/raw/main/data/country/ru/202104.csv.gz",
+		"https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/country/ru/202104.csv.gz",
 	}
 
 	trustedDomains = make(map[string]bool)
 	domainsMutex   sync.RWMutex
-
-	sslCache      = make(map[string]sslCacheEntry)
-	sslCacheMutex sync.RWMutex
 )
 
 const (
-	cacheFile       = "trusted_domains_cache.txt"
-	topDomainsLimit = 50000
-	sslCacheTTL     = 10 * time.Minute
+	cacheFile         = "trusted_domains_cache.txt"
+	topDomainsLimit   = 50000
+	phishingThreshold = 60
 )
+
 func initTrustedDomains() {
 	fallback := []string{
 		"google.com", "youtube.com", "facebook.com", "amazon.com", "wikipedia.org",
@@ -101,6 +102,7 @@ func initTrustedDomains() {
 		"netflix.com", "microsoft.com", "apple.com", "github.com", "stackoverflow.com",
 		"yandex.ru", "vk.com", "mail.ru", "sberbank.ru", "tbank.ru", "gosuslugi.ru",
 	}
+
 	domainsMutex.Lock()
 	for _, d := range fallback {
 		trustedDomains[d] = true
@@ -109,7 +111,7 @@ func initTrustedDomains() {
 
 	if info, err := os.Stat(cacheFile); err == nil && time.Since(info.ModTime()) < 7*24*time.Hour {
 		if loadDomainsFromFile(cacheFile) == nil {
-			log.Printf("Загружено %d мировых доменов из локального кэша", len(trustedDomains))
+			log.Printf("Загружено %d доменов из локального кэша", len(trustedDomains))
 			return
 		}
 	}
@@ -120,7 +122,7 @@ func initTrustedDomains() {
 			log.Printf("Не удалось обновить мировой список доменов (используется базовый): %v", err)
 			return
 		}
-		log.Printf("Успешно загружено %d мировых доменов в белый список", len(trustedDomains))
+		log.Printf("Успешно загружено %d доменов в белый список", len(trustedDomains))
 	}()
 }
 
@@ -166,24 +168,20 @@ func fetchFromURL(targetURL string) error {
 	scanner := bufio.NewScanner(gzReader)
 	count := 0
 	isHeader := true
-
 	for scanner.Scan() && count < topDomainsLimit {
 		line := scanner.Text()
 		if isHeader {
 			isHeader = false
 			continue
 		}
-
 		rawOrigin, _, found := strings.Cut(line, ",")
 		if !found {
 			continue
 		}
-
 		parsed, err := url.Parse(strings.TrimSpace(strings.ToLower(rawOrigin)))
 		if err != nil || parsed.Hostname() == "" {
 			continue
 		}
-
 		rootDomain := getRootDomain(parsed.Hostname())
 		if rootDomain != "" && !urlShorteners[rootDomain] && !newMap[rootDomain] {
 			newMap[rootDomain] = true
@@ -191,9 +189,11 @@ func fetchFromURL(targetURL string) error {
 			count++
 		}
 	}
-
 	if err := scanner.Err(); err != nil {
 		return err
+	}
+	if len(newMap) == 0 {
+		return fmt.Errorf("в ответе %s не найдено ни одного домена", targetURL)
 	}
 
 	domainsMutex.Lock()
@@ -202,7 +202,7 @@ func fetchFromURL(targetURL string) error {
 	}
 	domainsMutex.Unlock()
 
-	_ = os.WriteFile(cacheFile, []byte(strings.Join(linesToCache, "\n")), 0644)
+	_ = os.WriteFile(cacheFile, []byte(strings.Join(linesToCache, "\n")), 0o644)
 	return nil
 }
 
@@ -231,6 +231,7 @@ func isTrustedDomain(domain string) bool {
 	defer domainsMutex.RUnlock()
 	return trustedDomains[domain]
 }
+
 func calculateEntropy(s string) float64 {
 	if len(s) == 0 {
 		return 0
@@ -273,13 +274,11 @@ func levenshteinDistance(a, b string) int {
 	if m == 0 {
 		return n
 	}
-
 	prev := make([]int, m+1)
 	curr := make([]int, m+1)
 	for j := 0; j <= m; j++ {
 		prev[j] = j
 	}
-
 	for i := 1; i <= n; i++ {
 		curr[0] = i
 		for j := 1; j <= m; j++ {
@@ -290,7 +289,6 @@ func levenshteinDistance(a, b string) int {
 			del := prev[j] + 1
 			ins := curr[j-1] + 1
 			sub := prev[j-1] + cost
-
 			minVal := del
 			if ins < minVal {
 				minVal = ins
@@ -309,17 +307,14 @@ func checkTyposquatting(domainLabel string) (int, string) {
 	if len(domainLabel) < 3 {
 		return 0, ""
 	}
-
 	for brandKey, brandName := range protectedBrands {
 		if domainLabel == brandKey {
 			continue
 		}
-
 		maxDist := 1
 		if len([]rune(brandKey)) >= 7 {
 			maxDist = 2
 		}
-
 		dist := levenshteinDistance(domainLabel, brandKey)
 		if dist > 0 && dist <= maxDist {
 			return 55, fmt.Sprintf("Возможный тайпсквоттинг: домен '%s' подозрительно похож на бренд %s (разница в %d симв.).", domainLabel, brandName, dist)
@@ -328,63 +323,7 @@ func checkTyposquatting(domainLabel string) (int, string) {
 	return 0, ""
 }
 
-func checkSSL(host string) (int, []string) {
-	if net.ParseIP(host) != nil {
-		return 0, nil
-	}
-
-	sslCacheMutex.RLock()
-	if cached, exists := sslCache[host]; exists && time.Since(cached.checkedAt) < sslCacheTTL {
-		sslCacheMutex.RUnlock()
-		return cached.score, cached.reasons
-	}
-	sslCacheMutex.RUnlock()
-
-	var score int
-	var reasons []string
-
-	dialer := &net.Dialer{Timeout: 4 * time.Second}
-	conn, err := tls.DialWithDialer(dialer, "tcp", net.JoinHostPort(host, "443"), &tls.Config{
-		ServerName: host,
-	})
-
-	if err != nil {
-		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-			score += 30
-			reasons = append(reasons, "Таймаут SSL-проверки: сервер слишком долго не отвечает по порту 443.")
-		} else {
-			score += 65
-			reasons = append(reasons, fmt.Sprintf("Ошибка SSL/TLS: %v", err))
-		}
-	} else {
-		defer conn.Close()
-		certs := conn.ConnectionState().PeerCertificates
-		if len(certs) > 0 {
-			leaf := certs[0]
-
-			if time.Since(leaf.NotBefore) < 7*24*time.Hour {
-				score += 25
-				reasons = append(reasons, fmt.Sprintf("SSL-сертификат выпущен совсем недавно (%s) — частый признак однодневного фишинга.", leaf.NotBefore.Format("02.01.2006")))
-			}
-
-			if time.Until(leaf.NotAfter) < 3*24*time.Hour {
-				score += 20
-				reasons = append(reasons, "Срок действия SSL-сертификата истекает менее чем через 3 дня.")
-			}
-		}
-	}
-
-	sslCacheMutex.Lock()
-	sslCache[host] = sslCacheEntry{
-		score:     score,
-		reasons:   reasons,
-		checkedAt: time.Now(),
-	}
-	sslCacheMutex.Unlock()
-
-	return score, reasons
-}
-func analyzeURL(rawURL string) CheckResult {
+func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 	cleanURL := strings.TrimSpace(rawURL)
 	res := CheckResult{
 		URL:     cleanURL,
@@ -417,17 +356,25 @@ func analyzeURL(rawURL string) CheckResult {
 	rootDomain := getRootDomain(host)
 	isIP := net.ParseIP(host) != nil || numericHostRegex.MatchString(host)
 
+	// Возраст домена уточняется отдельным асинхронным запросом /api/domain.
+	res.Domain = rootDomain
+	if !isIP && !urlShorteners[rootDomain] && validDomain(rootDomain) {
+		res.WhoisStatus = "pending"
+	}
+
 	beforeQuery, _, _ := strings.Cut(lowerURL, "?")
 	hasAtTrick := parsed.User != nil || strings.Contains(beforeQuery, "@") || strings.Contains(beforeQuery, "%40")
 
-	if !hasAtTrick && !isIP && isTrustedDomain(rootDomain) {
+	if !hasAtTrick && !isIP && !untrustedPlatforms[rootDomain] && isTrustedDomain(rootDomain) {
 		res.IsPhish = false
 		res.Score = 0
+		res.WhoisStatus = "" // доверенный домен: реестр не опрашиваем
 		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' входит в мировой рейтинг доверенных сайтов.", rootDomain))
 		return res
 	}
 
 	domainLabel, _, _ := strings.Cut(rootDomain, ".")
+
 	if !isIP && !urlShorteners[rootDomain] {
 		if typoScore, typoReason := checkTyposquatting(domainLabel); typoScore > 0 {
 			res.Score += typoScore
@@ -509,30 +456,21 @@ func analyzeURL(rawURL string) CheckResult {
 	}
 	res.Score += keywordScore
 
-	if !isIP && !urlShorteners[rootDomain] && res.Score < 100 {
-		sslScore, sslReasons := checkSSL(host)
-		res.Score += sslScore
-		res.Reasons = append(res.Reasons, sslReasons...)
+	// TLS-проба — только если вердикт ещё не определён. Максимум sslMaxScore (35) баллов,
+	// то есть сама по себе она никогда не даёт «фишинг».
+	if !isIP && !urlShorteners[rootDomain] && res.Score < phishingThreshold {
+		rep := checkSSL(ctx, host)
+		res.SSL = &rep
+		res.SSLStatus = string(rep.Status)
+		res.Score += rep.Score
+		res.Reasons = append(res.Reasons, rep.Reasons...)
 	}
 
-	if res.Score >= 60 {
-		res.IsPhish = true
-	}
+	res.IsPhish = res.Score >= phishingThreshold
 	if res.Score > 100 {
 		res.Score = 100
 	}
-
 	return res
-}
-
-func indexHandler(w http.ResponseWriter, r *http.Request) {
-	tmplPath := filepath.Join("templates", "index.html")
-	tmpl, err := template.ParseFiles(tmplPath)
-	if err != nil {
-		http.Error(w, "Ошибка загрузки шаблона", http.StatusInternalServerError)
-		return
-	}
-	tmpl.Execute(w, nil)
 }
 
 func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
@@ -540,31 +478,95 @@ func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
 		return
 	}
+	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 
 	var req CheckRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Некорректный JSON", http.StatusBadRequest)
 		return
 	}
-
 	targetURL := strings.TrimSpace(req.URL)
 	if targetURL == "" {
 		http.Error(w, "Поле url не может быть пустым", http.StatusBadRequest)
 		return
 	}
+	if len(targetURL) > 2048 {
+		http.Error(w, "Слишком длинный URL", http.StatusBadRequest)
+		return
+	}
 
-	result := analyzeURL(targetURL)
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(result)
+	result := analyzeURL(ctx, targetURL)
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(result); err != nil {
+		log.Printf("encode check: %v", err)
+	}
+}
+
+func apiDomainHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+		return
+	}
+	d := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("domain")))
+	d = strings.TrimPrefix(d, "www.")
+	if !validDomain(d) {
+		http.Error(w, "Некорректный домен", http.StatusBadRequest)
+		return
+	}
+	d = getRootDomain(d) // к реестру ходим только за корневой домен
+
+	ctx, cancel := context.WithTimeout(r.Context(), whoisBudget+time.Second)
+	defer cancel()
+
+	info := checkDomain(ctx, d)
+
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	if err := json.NewEncoder(w).Encode(info); err != nil {
+		log.Printf("encode domain: %v", err)
+	}
 }
 
 func main() {
 	initTrustedDomains()
+	go initRDAPBootstrap()
 
-	http.HandleFunc("/", indexHandler)
-	http.HandleFunc("/api/check", apiCheckHandler)
+	tmpl := template.Must(template.ParseFiles(filepath.Join("templates", "index.html")))
 
-	fmt.Println("Сервер запущен на http://localhost:8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := tmpl.Execute(w, nil); err != nil {
+			log.Printf("template: %v", err)
+		}
+	})
+	mux.HandleFunc("/api/check", apiCheckHandler)
+	mux.HandleFunc("/api/domain", apiDomainHandler)
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	srv := &http.Server{
+		Addr:              ":8080", // только локально? поставьте "127.0.0.1:8080"
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      20 * time.Second, // > бюджета /api/domain (9 с)
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
+	}
+
+	log.Println("Сервер запущен на http://localhost:8080")
+	log.Fatal(srv.ListenAndServe())
 }

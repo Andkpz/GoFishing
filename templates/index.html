@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Проверка ссылки на фишинг</title>
+    <link rel="icon" href="data:,">
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -13,20 +14,9 @@
             padding-top: 80px;
             margin: 0;
         }
-        .container {
-            width: 100%;
-            max-width: 600px;
-            padding: 0 20px;
-        }
-        h1 {
-            font-size: 24px;
-            color: #212529;
-            margin-bottom: 20px;
-        }
-        .search-box {
-            display: flex;
-            gap: 10px;
-        }
+        .container { width: 100%; max-width: 600px; padding: 0 20px; }
+        h1 { font-size: 24px; color: #212529; margin-bottom: 20px; }
+        .search-box { display: flex; gap: 10px; }
         input[type="text"] {
             flex: 1;
             padding: 12px 15px;
@@ -35,9 +25,7 @@
             border-radius: 6px;
             outline: none;
         }
-        input[type="text"]:focus {
-            border-color: #0d6efd;
-        }
+        input[type="text"]:focus { border-color: #0d6efd; }
         button {
             padding: 12px 24px;
             font-size: 16px;
@@ -48,51 +36,67 @@
             cursor: pointer;
             transition: background-color 0.2s;
         }
-        button:hover {
-            background-color: #0b5ed7;
+        button:hover { background-color: #0b5ed7; }
+        button:disabled { background-color: #6c757d; cursor: not-allowed; }
+        .loader { display: none; margin-top: 20px; color: #495057; font-size: 15px; }
+        .result-box { display: none; margin-top: 20px; padding: 20px; border-radius: 8px; }
+        .safe { background-color: #d1e7dd; color: #0f5132; border: 1px solid #badbcc; }
+        .danger { background-color: #f8d7da; color: #842029; border: 1px solid #f5c2c7; }
+        .result-title { font-weight: bold; font-size: 18px; margin-bottom: 10px; word-break: break-all; }
+        .score { font-weight: bold; margin-bottom: 8px; }
+        .score-bar {
+            height: 6px;
+            background: rgba(0, 0, 0, .12);
+            border-radius: 3px;
+            overflow: hidden;
+            margin-bottom: 12px;
         }
-        button:disabled {
-            background-color: #6c757d;
-            cursor: not-allowed;
-        }
-        .loader {
+        .score-fill { height: 100%; width: 0; transition: width .3s ease; }
+        .safe .score-fill { background-color: #198754; }
+        .danger .score-fill { background-color: #dc3545; }
+        ul { margin: 0; padding-left: 20px; }
+        li { margin-bottom: 5px; }
+
+        .ssl-box {
             display: none;
-            margin-top: 20px;
-            color: #495057;
-            font-size: 15px;
+            margin-top: 14px;
+            padding: 12px 14px;
+            background: #ffffff;
+            border: 1px solid #dee2e6;
+            border-radius: 6px;
+            color: #343a40;
+            font-size: 14px;
         }
-        .result-box {
-            display: none;
-            margin-top: 20px;
-            padding: 20px;
-            border-radius: 8px;
-        }
-        .safe {
-            background-color: #d1e7dd;
-            color: #0f5132;
-            border: 1px solid #badbcc;
-        }
-        .danger {
-            background-color: #f8d7da;
-            color: #842029;
-            border: 1px solid #f5c2c7;
-        }
-        .result-title {
-            font-weight: bold;
-            font-size: 18px;
-            margin-bottom: 10px;
+        .ssl-ok    { border-left: 4px solid #198754; }
+        .ssl-warn  { border-left: 4px solid #ffc107; }
+        .ssl-bad   { border-left: 4px solid #dc3545; }
+        .ssl-muted { border-left: 4px solid #adb5bd; }
+        .ssl-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+        .ssl-time { margin-left: auto; font-weight: 400; font-size: 12px; color: #6c757d; white-space: nowrap; }
+        .ssl-meta { margin-top: 6px; color: #495057; line-height: 1.5; word-break: break-word; }
+        .ssl-notes { margin: 8px 0 0; padding-left: 18px; color: #6c757d; }
+        .ssl-box details { margin-top: 8px; }
+        .ssl-box summary { cursor: pointer; font-size: 13px; color: #6c757d; }
+        .ssl-box code {
+            display: block;
+            margin-top: 6px;
+            padding: 8px;
+            background: #f1f3f5;
+            border-radius: 4px;
+            font-size: 12px;
+            white-space: pre-wrap;
             word-break: break-all;
         }
-        .score {
-            font-weight: bold;
-            margin-bottom: 10px;
-        }
-        ul {
-            margin: 0;
-            padding-left: 20px;
-        }
-        li {
-            margin-bottom: 5px;
+        .incomplete {
+            display: none;
+            margin-top: 12px;
+            padding: 8px 10px;
+            background: #fff3cd;
+            border: 1px solid #ffecb5;
+            border-radius: 6px;
+            color: #664d03;
+            font-size: 13px;
+            line-height: 1.45;
         }
     </style>
 </head>
@@ -100,91 +104,341 @@
     <div class="container">
         <h1>Детектор фишинговых ссылок</h1>
         <div class="search-box">
-            <input type="text" id="urlInput" placeholder="Введите ссылку (например, https://example.com)" autocomplete="off">
+            <input type="text" id="urlInput" placeholder="Введите ссылку (например, https://example.com)"
+                   autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                   aria-label="Ссылка для проверки">
             <button id="checkBtn" onclick="checkURL()">Проверить</button>
         </div>
 
         <div id="loader" class="loader">Проверка ссылки и SSL-сертификата...</div>
 
-        <div id="resultBox" class="result-box">
+        <div id="resultBox" class="result-box" aria-live="polite">
             <div class="result-title" id="resultTitle"></div>
             <div class="score" id="resultScore"></div>
+            <div class="score-bar"><div class="score-fill" id="scoreFill"></div></div>
             <ul id="resultReasons"></ul>
+            <div id="incompleteNote" class="incomplete"></div>
+            <div id="sslBox" class="ssl-box"></div>
+            <div id="whoisBox" class="ssl-box"></div>
         </div>
     </div>
 
     <script>
-        const urlInput = document.getElementById('urlInput');
-        const checkBtn = document.getElementById('checkBtn');
-        const loader = document.getElementById('loader');
-        const resultBox = document.getElementById('resultBox');
-        const resultTitle = document.getElementById('resultTitle');
-        const resultScore = document.getElementById('resultScore');
-        const resultReasons = document.getElementById('resultReasons');
+        const urlInput       = document.getElementById('urlInput');
+        const checkBtn       = document.getElementById('checkBtn');
+        const loader         = document.getElementById('loader');
+        const resultBox      = document.getElementById('resultBox');
+        const resultTitle    = document.getElementById('resultTitle');
+        const resultScore    = document.getElementById('resultScore');
+        const scoreFill      = document.getElementById('scoreFill');
+        const resultReasons  = document.getElementById('resultReasons');
+        const sslBox         = document.getElementById('sslBox');
+        const whoisBox       = document.getElementById('whoisBox');
+        const incompleteNote = document.getElementById('incompleteNote');
 
-        urlInput.addEventListener('input', function() {
-            resultBox.style.display = 'none';
-            resultReasons.innerHTML = '';
-        });
+        const REQUEST_TIMEOUT_MS = 6000;   // /api/check укладывается в ~2 с
+        const DOMAIN_TIMEOUT_MS  = 15000;  // /api/domain: RDAP + WHOIS до 9 с
+        const PHISH_THRESHOLD    = 60;     // = phishingThreshold в main.go
 
-        urlInput.addEventListener('keypress', function(e) {
+        let runId = 0, baseResult = null, domainCtrl = null;
+
+        const SSL_VIEW = {
+            ok:      { icon: '🔒', cls: 'ssl-ok',    title: 'TLS-сертификат валиден' },
+            invalid: { icon: '⚠️', cls: 'ssl-bad',   title: 'TLS-сертификат не прошёл проверку' },
+            no_tls:  { icon: '🔓', cls: 'ssl-warn',  title: 'HTTPS недоступен: порт 443 закрыт или на нём не TLS' },
+            no_dns:  { icon: '❓', cls: 'ssl-warn',  title: 'Домен не резолвится' },
+            unknown: { icon: '⏱️', cls: 'ssl-muted', title: 'Сертификат проверить не удалось' },
+            skipped: { icon: '⏭️', cls: 'ssl-muted', title: 'SSL-проверка не выполнялась' },
+            blocked: { icon: '🛡️', cls: 'ssl-muted', title: 'SSL-проверка заблокирована: приватный адрес' }
+        };
+        const INCOMPLETE = new Set(['unknown', 'skipped', 'blocked']);
+
+        const WHOIS_VIEW = {
+            ok:        { icon: '📅', cls: 'ssl-ok',    title: 'Данные о домене получены' },
+            not_found: { icon: '❌', cls: 'ssl-bad',   title: 'Домен не зарегистрирован' },
+            limited:   { icon: '🚦', cls: 'ssl-muted', title: 'WHOIS ограничил запросы (rate limit)' },
+            unknown:   { icon: '❔', cls: 'ssl-muted', title: 'Возраст домена определить не удалось' },
+            skipped:   { icon: '⏭️', cls: 'ssl-muted', title: 'Проверка домена пропущена' }
+        };
+
+        urlInput.addEventListener('input', hideResult);
+        urlInput.addEventListener('keydown', function (e) {
             if (e.key === 'Enter') {
+                e.preventDefault();
                 checkURL();
             }
         });
 
+        function hideResult() {
+            resultBox.style.display = 'none';
+            resultReasons.replaceChildren();
+            sslBox.replaceChildren();
+            sslBox.style.display = 'none';
+            whoisBox.replaceChildren();
+            whoisBox.style.display = 'none';
+            incompleteNote.style.display = 'none';
+            scoreFill.style.width = '0';
+            baseResult = null;
+            if (domainCtrl) { domainCtrl.abort(); domainCtrl = null; }
+        }
+
+        function li(text) {
+            const item = document.createElement('li');
+            item.textContent = text; // только textContent: часть строк приходит из чужих сертификатов и whois
+            return item;
+        }
+
+        function fmtDate(iso) {
+            const d = new Date(iso);
+            return isNaN(d.getTime())
+                ? iso
+                : d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
+        }
+
+        function formatAge(days) {
+            if (days < 60) return days + ' дн.';
+            if (days < 730) return Math.round(days / 30) + ' мес.';
+            return (days / 365).toFixed(1) + ' лет';
+        }
+
         async function checkURL() {
             const url = urlInput.value.trim();
-            if (!url) return;
+            if (!url || checkBtn.disabled) return;
+            const run = ++runId;
 
             checkBtn.disabled = true;
-            resultBox.style.display = 'none';
+            hideResult();
             loader.style.display = 'block';
+
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
 
             try {
                 const response = await fetch('/api/check', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: url })
+                    body: JSON.stringify({ url: url }),
+                    signal: ctrl.signal
                 });
 
                 if (!response.ok) {
-                    throw new Error('Ошибка сервера: ' + response.status);
+                    const text = (await response.text()).trim();
+                    throw new Error(text || ('Ошибка сервера: ' + response.status));
                 }
 
                 const data = await response.json();
+                if (run !== runId) return;
                 renderResult(data);
+                maybeFetchDomain(data, run);
             } catch (err) {
-                resultBox.className = 'result-box danger';
-                resultTitle.textContent = 'Ошибка проверки';
-                resultScore.textContent = '';
-                resultReasons.innerHTML = `<li>${err.message}</li>`;
-                resultBox.style.display = 'block';
+                if (run !== runId) return;
+                renderError(err.name === 'AbortError'
+                    ? 'Сервер не ответил за 6 секунд. Проверьте, что процесс запущен.'
+                    : err.message);
             } finally {
-                checkBtn.disabled = false;
-                loader.style.display = 'none';
+                clearTimeout(timer);
+                if (run === runId) {
+                    checkBtn.disabled = false;
+                    loader.style.display = 'none';
+                }
             }
+        }
+
+        function renderError(message) {
+            resultBox.className = 'result-box danger';
+            resultTitle.textContent = 'Ошибка проверки';
+            resultScore.textContent = '';
+            scoreFill.style.width = '0';
+            resultReasons.replaceChildren(li(message));
+            resultBox.style.display = 'block';
         }
 
         function renderResult(data) {
             resultBox.className = 'result-box ' + (data.is_phish ? 'danger' : 'safe');
-            resultTitle.textContent = (data.is_phish ? '⚠️ Обнаружен высокий риск фишинга: ' : '✅ Результат для: ') + data.url;
-            resultScore.textContent = `Оценка риска: ${data.score} / 100`;
+            resultTitle.textContent = (data.is_phish
+                ? '⚠️ Обнаружен высокий риск фишинга: '
+                : '✅ Результат для: ') + data.url;
 
-            resultReasons.innerHTML = '';
-            if (data.reasons && data.reasons.length > 0) {
-                data.reasons.forEach(reason => {
-                    const li = document.createElement('li');
-                    li.textContent = reason;
-                    resultReasons.appendChild(li);
-                });
-            } else {
-                const li = document.createElement('li');
-                li.textContent = 'Подозрительных признаков не обнаружено.';
-                resultReasons.appendChild(li);
+            const score = Math.max(0, Math.min(100, Number(data.score) || 0));
+            resultScore.textContent = `Оценка риска: ${score} / 100`;
+            scoreFill.style.width = score + '%';
+
+            const reasons = (data.reasons && data.reasons.length)
+                ? data.reasons
+                : ['Подозрительных признаков не обнаружено.'];
+            resultReasons.replaceChildren(...reasons.map(li));
+
+            renderSSL(data);
+            resultBox.style.display = 'block';
+        }
+
+        function renderSSL(data) {
+            const ssl = data.ssl || null;
+            const status = data.ssl_status || (ssl && ssl.status) || '';
+
+            sslBox.replaceChildren();
+            incompleteNote.style.display = 'none';
+
+            if (!status) {
+                sslBox.style.display = 'none';
+                return;
             }
 
-            resultBox.style.display = 'block';
+            const view = SSL_VIEW[status] || { icon: 'ℹ️', cls: 'ssl-muted', title: 'SSL: ' + status };
+            sslBox.className = 'ssl-box ' + view.cls;
+
+            const head = document.createElement('div');
+            head.className = 'ssl-head';
+            const label = document.createElement('span');
+            label.textContent = view.icon + ' ' + view.title;
+            head.appendChild(label);
+            if (ssl && ssl.elapsed_ms > 0) {
+                const time = document.createElement('span');
+                time.className = 'ssl-time';
+                time.textContent = ssl.elapsed_ms + ' мс';
+                head.appendChild(time);
+            }
+            sslBox.appendChild(head);
+
+            const meta = [];
+            if (ssl && ssl.issuer) meta.push('Издатель: ' + ssl.issuer);
+            if (ssl && ssl.not_before) {
+                meta.push('Выпущен: ' + fmtDate(ssl.not_before) +
+                    (ssl.cert_age_days > 0 ? ` (${ssl.cert_age_days} дн. назад)` : ''));
+            }
+            if (ssl && ssl.not_after) meta.push('Действует до: ' + fmtDate(ssl.not_after));
+            if (meta.length) {
+                const m = document.createElement('div');
+                m.className = 'ssl-meta';
+                m.textContent = meta.join(' · ');
+                sslBox.appendChild(m);
+            }
+
+            if (ssl && Array.isArray(ssl.notes) && ssl.notes.length) {
+                const ul = document.createElement('ul');
+                ul.className = 'ssl-notes';
+                ssl.notes.forEach(n => ul.appendChild(li(n)));
+                sslBox.appendChild(ul);
+            }
+
+            if (ssl && ssl.detail) {
+                const details = document.createElement('details');
+                const summary = document.createElement('summary');
+                summary.textContent = 'Технические подробности';
+                const code = document.createElement('code');
+                code.textContent = ssl.detail;
+                details.append(summary, code);
+                sslBox.appendChild(details);
+            }
+
+            sslBox.style.display = 'block';
+
+            if (INCOMPLETE.has(status)) {
+                incompleteNote.textContent = 'Проверка выполнена не полностью: данные о TLS-сертификате ' +
+                    'получить не удалось. Это не признак фишинга, но и не подтверждение безопасности.';
+                incompleteNote.style.display = 'block';
+            }
+        }
+
+        async function maybeFetchDomain(data, run) {
+            if (!data.domain || data.whois_status !== 'pending') return;
+            baseResult = data;
+
+            whoisBox.className = 'ssl-box ssl-muted';
+            const head = document.createElement('div');
+            head.className = 'ssl-head';
+            head.textContent = '⏳ Уточняем возраст домена ' + data.domain + ' (RDAP/WHOIS)...';
+            whoisBox.replaceChildren(head);
+            whoisBox.style.display = 'block';
+
+            domainCtrl = new AbortController();
+            const timer = setTimeout(() => domainCtrl.abort(), DOMAIN_TIMEOUT_MS);
+            try {
+                const resp = await fetch('/api/domain?domain=' + encodeURIComponent(data.domain),
+                                       { signal: domainCtrl.signal });
+                if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                const info = await resp.json();
+                if (run !== runId || !baseResult) return;
+                renderWhois(info);
+                applyDomainScore(info);
+            } catch (err) {
+                if (run !== runId || !baseResult) return;
+                renderWhois({ status: 'unknown',
+                    detail: err.name === 'AbortError' ? 'таймаут 15 с' : err.message });
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+
+        function renderWhois(info) {
+            const view = WHOIS_VIEW[info.status] || WHOIS_VIEW.unknown;
+            let cls = view.cls, title = view.title;
+            if (info.status === 'ok' && info.created) {
+                title = 'Возраст домена: ' + formatAge(info.age_days || 0);
+                cls = info.score >= 25 ? 'ssl-bad' : (info.score > 0 ? 'ssl-warn' : 'ssl-ok');
+            }
+            whoisBox.className = 'ssl-box ' + cls;
+            whoisBox.replaceChildren();
+
+            const head = document.createElement('div');
+            head.className = 'ssl-head';
+            const label = document.createElement('span');
+            label.textContent = view.icon + ' ' + title;
+            head.appendChild(label);
+            const timing = document.createElement('span');
+            timing.className = 'ssl-time';
+            timing.textContent = info.cached ? 'из кэша' : ((info.elapsed_ms || 0) + ' мс');
+            head.appendChild(timing);
+            whoisBox.appendChild(head);
+
+            const meta = [];
+            if (info.created) meta.push('Зарегистрирован: ' + fmtDate(info.created));
+            if (info.expires) meta.push('Оплачен до: ' + fmtDate(info.expires));
+            if (info.registrar) meta.push('Регистратор: ' + info.registrar);
+            if (info.source) meta.push('Источник: ' + info.source);
+            if (meta.length) {
+                const m = document.createElement('div');
+                m.className = 'ssl-meta';
+                m.textContent = meta.join(' · ');
+                whoisBox.appendChild(m);
+            }
+
+            if (Array.isArray(info.notes) && info.notes.length) {
+                const ul = document.createElement('ul');
+                ul.className = 'ssl-notes';
+                info.notes.forEach(n => ul.appendChild(li(n)));
+                whoisBox.appendChild(ul);
+            }
+
+            if (info.detail) {
+                const d = document.createElement('details');
+                const s = document.createElement('summary');
+                s.textContent = 'Технические подробности';
+                const c = document.createElement('code');
+                c.textContent = info.detail;
+                d.append(s, c);
+                whoisBox.appendChild(d);
+            }
+
+            whoisBox.style.display = 'block';
+        }
+
+        function applyDomainScore(info) {
+            if (!baseResult) return;
+            const total = Math.max(0, Math.min(100,
+                (Number(baseResult.score) || 0) + (Number(info.score) || 0)));
+            const phish = total >= PHISH_THRESHOLD;
+
+            resultBox.className = 'result-box ' + (phish ? 'danger' : 'safe');
+            resultTitle.textContent = (phish
+                ? '⚠️ Обнаружен высокий риск фишинга: '
+                : '✅ Результат для: ') + baseResult.url;
+            resultScore.textContent = `Оценка риска: ${total} / 100 (уточнено по данным реестра)`;
+            scoreFill.style.width = total + '%';
+
+            const reasons = [...(baseResult.reasons || []), ...(info.reasons || [])];
+            resultReasons.replaceChildren(...(reasons.length
+                ? reasons : ['Подозрительных признаков не обнаружено.']).map(li));
         }
     </script>
 </body>
