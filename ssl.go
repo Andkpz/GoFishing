@@ -80,27 +80,38 @@ var (
 	sslFlights = make(map[string]*sslCall)
 	sslSlots   = make(chan struct{}, sslMaxConcurrent)
 
-	rootsOnce sync.Once
-	rootsPool *x509.CertPool
+	rootsMu        sync.Mutex
+	rootsPool      *x509.CertPool
+	rootsNextRetry time.Time
 )
 
 func rootCAs() *x509.CertPool {
-	rootsOnce.Do(func() {
-		p, err := x509.SystemCertPool()
-		if err != nil {
-			log.Printf("SSL: системные корневые сертификаты недоступны (%v); "+
-				"проверяю только имя и срок. В Docker-образе нужен пакет ca-certificates.", err)
-			return
-		}
-		rootsPool = p
-	})
+	rootsMu.Lock()
+	defer rootsMu.Unlock()
+	if rootsPool != nil {
+		return rootsPool
+	}
+	if time.Now().Before(rootsNextRetry) {
+		return nil
+	}
+	p, err := x509.SystemCertPool()
+	if err != nil || p == nil {
+		log.Printf("SSL: системное хранилище корневых сертификатов недоступно (%v); повторю попытку позже", err)
+		rootsNextRetry = time.Now().Add(time.Minute)
+		return nil
+	}
+	rootsPool = p
 	return rootsPool
 }
 
 // checkSSL — единственная точка входа: кэш → single-flight → проба.
 func checkSSL(ctx context.Context, host string) SSLReport {
-	if host == "" || net.ParseIP(host) != nil {
-		return SSLReport{Status: SSLSkipped, Detail: "IP-литерал, TLS-имя не проверяется"}
+	host, err := normalizeHost(host)
+	if err != nil || host == "" || net.ParseIP(host) != nil {
+		return SSLReport{Status: SSLSkipped, Detail: "некорректное имя или IP-литерал"}
+	}
+	if err := ctx.Err(); err != nil {
+		return SSLReport{Status: SSLSkipped, Detail: "проверка отменена до запуска: " + err.Error()}
 	}
 
 	sslMu.Lock()
@@ -122,13 +133,17 @@ func checkSSL(ctx context.Context, host string) SSLReport {
 	sslMu.Unlock()
 
 	report := probeTLS(ctx, host)
+	cancelled := ctx.Err() != nil
+	if cancelled {
+		report = SSLReport{Status: SSLSkipped, Detail: "контекст запроса отменён: " + ctx.Err().Error()}
+	}
 	report.checkedAt = time.Now()
 	report.ttl = report.cacheTTL()
 
 	sslMu.Lock()
 	call.report = report
 	delete(sslFlights, host)
-	if report.ttl > 0 {
+	if report.ttl > 0 && !cancelled {
 		sslCache[host] = report
 		if len(sslCache) > sslCacheMax {
 			evictSSLLocked()
@@ -163,8 +178,8 @@ func probeTLS(ctx context.Context, host string) (rep SSLReport) {
 	select {
 	case sslSlots <- struct{}{}:
 		defer func() { <-sslSlots }()
-	default:
-		return SSLReport{Status: SSLSkipped, Detail: "лимит параллельных SSL-проверок"}
+	case <-ctx.Done():
+		return SSLReport{Status: SSLSkipped, Detail: "ожидание свободного слота отменено"}
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, sslBudget)
@@ -207,22 +222,20 @@ func probeTLS(ctx context.Context, host string) (rep SSLReport) {
 		inter.AddCert(c)
 	}
 
-	var verifyErr error
-	if roots := rootCAs(); roots != nil {
-		_, verifyErr = leaf.Verify(x509.VerifyOptions{
-			DNSName:       host,
-			Roots:         roots,
-			Intermediates: inter,
-			CurrentTime:   time.Now(),
-		})
-	} else {
-		// Нет системного хранилища корней — проверяем хотя бы имя и срок.
-		if err := leaf.VerifyHostname(host); err != nil {
-			verifyErr = err
-		} else if now := time.Now(); now.Before(leaf.NotBefore) || now.After(leaf.NotAfter) {
-			verifyErr = x509.CertificateInvalidError{Cert: leaf, Reason: x509.Expired}
-		}
+	roots := rootCAs()
+	if roots == nil {
+		// Не выдаём SSLOK, если цепочку доверия невозможно проверить.
+		// Иначе самоподписанный сертификат мог бы считаться валидным.
+		rep.Status = SSLUnknown
+		rep.Detail = "системное хранилище корневых сертификатов недоступно"
+		return rep
 	}
+	_, verifyErr := leaf.Verify(x509.VerifyOptions{
+		DNSName:       host,
+		Roots:         roots,
+		Intermediates: inter,
+		CurrentTime:   time.Now(),
+	})
 
 	if verifyErr != nil {
 		rep.Status = SSLInvalid
@@ -250,7 +263,7 @@ func probeTLS(ctx context.Context, host string) (rep SSLReport) {
 
 	// Только информация, без баллов: у Let's Encrypt сертификат моложе 7 дней
 	// примерно у четверти честных сайтов в любой момент времени.
-	if age := time.Since(leaf.NotBefore); age < 7*24*time.Hour {
+	if age := time.Since(leaf.NotBefore); age >= 0 && age < 7*24*time.Hour {
 		rep.Notes = append(rep.Notes, fmt.Sprintf(
 			"Сертификат выпущен %s (%d дн. назад). Само по себе не признак фишинга: короткие сроки — норма для ACME/CA.",
 			leaf.NotBefore.Format("02.01.2006"), rep.CertAgeDays))
@@ -316,7 +329,7 @@ var blockedNets = mustParseCIDRs([]string{
 	"192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
 	"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4", "255.255.255.255/32",
 	"::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8",
-	"64:ff9b::/96", "2001:db8::/32",
+	"64:ff9b::/96", "2001::/23", "2001:db8::/32", "2002::/16",
 })
 
 func mustParseCIDRs(list []string) []*net.IPNet {
@@ -333,7 +346,8 @@ func mustParseCIDRs(list []string) []*net.IPNet {
 
 func isPublicAddr(ip net.IP) bool {
 	if ip == nil || ip.IsUnspecified() || ip.IsLoopback() ||
-		ip.IsLinkLocalUnicast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
+		ip.IsLinkLocalUnicast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() ||
+		!ip.IsGlobalUnicast() {
 		return false
 	}
 	if v4 := ip.To4(); v4 != nil {

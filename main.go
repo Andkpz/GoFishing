@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"math"
 	"net"
@@ -15,9 +17,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/idna"
+	"golang.org/x/net/publicsuffix"
 )
 
 type CheckRequest struct {
@@ -25,19 +32,19 @@ type CheckRequest struct {
 }
 
 type CheckResult struct {
-	URL         string     `json:"url"`
-	IsPhish     bool       `json:"is_phish"`
-	Score       int        `json:"score"`
-	Reasons     []string   `json:"reasons"`
-	Domain      string     `json:"domain,omitempty"`
-	SSLStatus   string     `json:"ssl_status,omitempty"`
-	SSL         *SSLReport `json:"ssl,omitempty"`
-	WhoisStatus string     `json:"whois_status,omitempty"`
+	URL         string             `json:"url"`
+	IsPhish     bool               `json:"is_phish"`
+	Score       int                `json:"score"`
+	Reasons     []string           `json:"reasons"`
+	Domain      string             `json:"domain,omitempty"`
+	SSLStatus   string             `json:"ssl_status,omitempty"`
+	SSL         *SSLReport         `json:"ssl,omitempty"`
+	WhoisStatus string             `json:"whois_status,omitempty"`
+	ThreatIntel *ThreatIntelReport `json:"threat_intel,omitempty"`
 }
 
 var (
 	numericHostRegex = regexp.MustCompile(`^[0-9.]+$`)
-	multiPartTLDs    = []string{".co.uk", ".org.uk", ".gov.uk", ".com.au", ".net.au", ".org.ru", ".net.ru", ".com.ru"}
 	suspiciousTLDs   = []string{".xyz", ".top", ".tk", ".ml", ".gq", ".cf", ".ga", ".zip", ".mov", ".icu"}
 
 	urlShorteners = map[string]bool{
@@ -139,70 +146,129 @@ func downloadAndCacheDomains() error {
 }
 
 func fetchFromURL(targetURL string) error {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequest("GET", targetURL, nil)
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return fmt.Errorf("слишком много редиректов")
+			}
+			if req.URL.Scheme != "https" || req.URL.Hostname() != "github.com" && req.URL.Hostname() != "raw.githubusercontent.com" {
+				return fmt.Errorf("запрещённый адрес редиректа")
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) PhishDetector/1.0")
+	req.Header.Set("User-Agent", "PhishDetector/1.0")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("сервер вернул статус %d для %s", resp.StatusCode, targetURL)
 	}
 
-	gzReader, err := gzip.NewReader(resp.Body)
+	// Ограничиваем распакованный поток, чтобы повреждённый gzip не исчерпал память/диск.
+	gzReader, err := gzip.NewReader(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
-		return fmt.Errorf("ошибка распаковки GZIP: %v", err)
+		return fmt.Errorf("ошибка распаковки GZIP: %w", err)
 	}
 	defer gzReader.Close()
 
-	newMap := make(map[string]bool, topDomainsLimit)
-	var linesToCache []string
+	reader := csv.NewReader(io.LimitReader(gzReader, 256<<20))
+	reader.FieldsPerRecord = -1
+	header, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать CSV-заголовок: %w", err)
+	}
+	originColumn := -1
+	for i, field := range header {
+		if strings.EqualFold(strings.TrimSpace(field), "origin") {
+			originColumn = i
+			break
+		}
+	}
+	if originColumn < 0 {
+		return fmt.Errorf("в CSV отсутствует колонка origin")
+	}
 
-	scanner := bufio.NewScanner(gzReader)
-	count := 0
-	isHeader := true
-	for scanner.Scan() && count < topDomainsLimit {
-		line := scanner.Text()
-		if isHeader {
-			isHeader = false
+	newMap := make(map[string]bool, topDomainsLimit)
+	linesToCache := make([]string, 0, topDomainsLimit)
+	for len(linesToCache) < topDomainsLimit {
+		record, readErr := reader.Read()
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return fmt.Errorf("ошибка чтения CSV: %w", readErr)
+		}
+		if originColumn >= len(record) {
 			continue
 		}
-		rawOrigin, _, found := strings.Cut(line, ",")
-		if !found {
+		rawOrigin := strings.TrimSpace(record[originColumn])
+		parsed, parseErr := url.Parse(rawOrigin)
+		if parseErr != nil || parsed.Scheme != "https" && parsed.Scheme != "http" || parsed.Hostname() == "" {
 			continue
 		}
-		parsed, err := url.Parse(strings.TrimSpace(strings.ToLower(rawOrigin)))
-		if err != nil || parsed.Hostname() == "" {
+		host, normErr := normalizeHost(parsed.Hostname())
+		if normErr != nil || net.ParseIP(host) != nil {
 			continue
 		}
-		rootDomain := getRootDomain(parsed.Hostname())
+		rootDomain := getRootDomain(host)
 		if rootDomain != "" && !urlShorteners[rootDomain] && !newMap[rootDomain] {
 			newMap[rootDomain] = true
 			linesToCache = append(linesToCache, rootDomain)
-			count++
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return err
 	}
 	if len(newMap) == 0 {
 		return fmt.Errorf("в ответе %s не найдено ни одного домена", targetURL)
 	}
 
-	domainsMutex.Lock()
-	for k, v := range newMap {
-		trustedDomains[k] = v
+	// Сначала атомарно сохраняем, затем публикуем новый набор в памяти.
+	if err := writeDomainsAtomically(cacheFile, linesToCache); err != nil {
+		return fmt.Errorf("не удалось сохранить кэш доменов: %w", err)
 	}
+	domainsMutex.Lock()
+	trustedDomains = newMap
 	domainsMutex.Unlock()
+	return nil
+}
 
-	_ = os.WriteFile(cacheFile, []byte(strings.Join(linesToCache, "\n")), 0o644)
+func writeDomainsAtomically(filename string, domains []string) error {
+	dir := filepath.Dir(filename)
+	if dir == "." {
+		dir = "."
+	}
+	f, err := os.CreateTemp(dir, ".trusted-domains-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		_ = f.Close()
+		if !ok {
+			_ = os.Remove(tmp)
+		}
+	}()
+	if _, err = f.WriteString(strings.Join(domains, "\n") + "\n"); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	if err = os.Rename(tmp, filename); err != nil {
+		return err
+	}
+	ok = true
 	return nil
 }
 
@@ -249,20 +315,37 @@ func calculateEntropy(s string) float64 {
 	return entropy
 }
 
+func normalizeHost(host string) (string, error) {
+	host = strings.TrimSuffix(strings.TrimSpace(strings.ToLower(host)), ".")
+	if host == "" {
+		return "", fmt.Errorf("пустое имя хоста")
+	}
+	ascii, err := idna.Lookup.ToASCII(host)
+	if err != nil {
+		return "", fmt.Errorf("некорректное IDN-имя: %w", err)
+	}
+	ascii = strings.ToLower(strings.TrimSuffix(ascii, "."))
+	if len(ascii) > 253 {
+		return "", fmt.Errorf("имя хоста длиннее 253 байт")
+	}
+	return ascii, nil
+}
+
 func getRootDomain(host string) string {
-	cleanHost := strings.TrimPrefix(host, "www.")
-	for _, tld := range multiPartTLDs {
-		if strings.HasSuffix(cleanHost, tld) {
-			withoutTLD := strings.TrimSuffix(cleanHost, tld)
-			parts := strings.Split(withoutTLD, ".")
-			return parts[len(parts)-1] + tld
-		}
+	host, err := normalizeHost(host)
+	if err != nil {
+		return ""
 	}
-	parts := strings.Split(cleanHost, ".")
-	if len(parts) >= 2 {
-		return parts[len(parts)-2] + "." + parts[len(parts)-1]
+	if net.ParseIP(host) != nil {
+		return host
 	}
-	return cleanHost
+	root, err := publicsuffix.EffectiveTLDPlusOne(host)
+	if err != nil {
+		// Для localhost и неизвестных внутренних имён возвращаем сам host;
+		// такие значения не должны автоматически становиться доверенными.
+		return host
+	}
+	return root
 }
 
 func levenshteinDistance(a, b string) int {
@@ -307,7 +390,14 @@ func checkTyposquatting(domainLabel string) (int, string) {
 	if len(domainLabel) < 3 {
 		return 0, ""
 	}
-	for brandKey, brandName := range protectedBrands {
+	brandKeys := make([]string, 0, len(protectedBrands))
+	for key := range protectedBrands {
+		brandKeys = append(brandKeys, key)
+	}
+	sort.Strings(brandKeys)
+	bestDist := math.MaxInt
+	bestBrand := ""
+	for _, brandKey := range brandKeys {
 		if domainLabel == brandKey {
 			continue
 		}
@@ -316,9 +406,12 @@ func checkTyposquatting(domainLabel string) (int, string) {
 			maxDist = 2
 		}
 		dist := levenshteinDistance(domainLabel, brandKey)
-		if dist > 0 && dist <= maxDist {
-			return 55, fmt.Sprintf("Возможный тайпсквоттинг: домен '%s' подозрительно похож на бренд %s (разница в %d симв.).", domainLabel, brandName, dist)
+		if dist > 0 && dist <= maxDist && dist < bestDist {
+			bestDist, bestBrand = dist, brandKey
 		}
+	}
+	if bestBrand != "" {
+		return 55, fmt.Sprintf("Возможный тайпсквоттинг: домен '%s' подозрительно похож на бренд %s (разница в %d симв.).", domainLabel, protectedBrands[bestBrand], bestDist)
 	}
 	return 0, ""
 }
@@ -337,24 +430,56 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		return res
 	}
 
-	lowerURL := strings.ToLower(cleanURL)
-	hasExplicitScheme := strings.HasPrefix(lowerURL, "http://") || strings.HasPrefix(lowerURL, "https://")
+	hasExplicitScheme := strings.Contains(cleanURL, "://")
 	urlToParse := cleanURL
 	if !hasExplicitScheme {
-		urlToParse = "http://" + cleanURL
+		urlToParse = "https://" + cleanURL
 	}
 
 	parsed, err := url.Parse(urlToParse)
-	if err != nil || parsed.Host == "" {
+	if err != nil || parsed.Host == "" || parsed.Opaque != "" || parsed.User != nil {
 		res.IsPhish = true
 		res.Score = 100
-		res.Reasons = append(res.Reasons, "Некорректный формат ссылки.")
+		res.Reasons = append(res.Reasons, "Некорректный формат ссылки или маскировка через userinfo.")
 		return res
 	}
-
-	host := strings.ToLower(parsed.Hostname())
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		res.IsPhish = true
+		res.Score = 100
+		res.Reasons = append(res.Reasons, "Разрешены только схемы http и https.")
+		return res
+	}
+	host, err := normalizeHost(parsed.Hostname())
+	if err != nil {
+		res.IsPhish = true
+		res.Score = 100
+		res.Reasons = append(res.Reasons, "Некорректное доменное имя: "+err.Error())
+		return res
+	}
+	if port := parsed.Port(); port != "" {
+		portNum, convErr := strconv.Atoi(port)
+		if convErr != nil || portNum < 1 || portNum > 65535 {
+			res.IsPhish = true
+			res.Score = 100
+			res.Reasons = append(res.Reasons, "Некорректный порт в URL.")
+			return res
+		}
+	}
 	rootDomain := getRootDomain(host)
 	isIP := net.ParseIP(host) != nil || numericHostRegex.MatchString(host)
+	// Threat Intelligence: точное совпадение с известными фишинговыми URL.
+	// Внешняя проверка ограничена контекстом запроса и не блокирует эвристики при сбое провайдера.
+	intel := checkThreatIntel(ctx, urlToParse)
+	res.ThreatIntel = &intel
+	if intel.Status == "hit" {
+		res.Score = 100
+		res.IsPhish = true
+		res.Reasons = append(res.Reasons, intel.Reasons...)
+		return res
+	}
+	if len(intel.Reasons) > 0 {
+		res.Reasons = append(res.Reasons, intel.Reasons...)
+	}
 
 	// Возраст домена уточняется отдельным асинхронным запросом /api/domain.
 	res.Domain = rootDomain
@@ -362,15 +487,15 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.WhoisStatus = "pending"
 	}
 
-	beforeQuery, _, _ := strings.Cut(lowerURL, "?")
-	hasAtTrick := parsed.User != nil || strings.Contains(beforeQuery, "@") || strings.Contains(beforeQuery, "%40")
+	authority := parsed.Host
+	decodedAuthority, decodeErr := url.QueryUnescape(authority)
+	hasAtTrick := strings.Contains(authority, "%40") || decodeErr == nil && strings.Contains(decodedAuthority, "@")
 
-	if !hasAtTrick && !isIP && !untrustedPlatforms[rootDomain] && isTrustedDomain(rootDomain) {
-		res.IsPhish = false
-		res.Score = 0
-		res.WhoisStatus = "" // доверенный домен: реестр не опрашиваем
-		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' входит в мировой рейтинг доверенных сайтов.", rootDomain))
-		return res
+	trusted := !isIP && !untrustedPlatforms[rootDomain] && isTrustedDomain(rootDomain)
+	if trusted {
+		// Популярность домена — только справочная информация, не доказательство
+		// безопасности конкретного URL и не основание пропускать проверки.
+		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' присутствует в рейтинге популярных сайтов; остальные проверки всё равно выполнены.", rootDomain))
 	}
 
 	domainLabel, _, _ := strings.Cut(rootDomain, ".")
@@ -430,15 +555,8 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Высокая энтропия домена (имя похоже на случайно сгенерированный набор символов).")
 	}
 
-	cleanHost := strings.TrimPrefix(host, "www.")
-	effectiveHost := cleanHost
-	for _, tld := range multiPartTLDs {
-		if strings.HasSuffix(cleanHost, tld) {
-			effectiveHost = strings.TrimSuffix(cleanHost, tld) + ".tld"
-			break
-		}
-	}
-	if len(strings.Split(effectiveHost, ".")) > 3 {
+	extraSubdomains := strings.TrimSuffix(host, "."+rootDomain)
+	if extraSubdomains != "" {
 		res.Score += 20
 		res.Reasons = append(res.Reasons, "Подозрительно большое количество поддоменов.")
 	}
@@ -481,8 +599,14 @@ func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 	r.Body = http.MaxBytesReader(w, r.Body, 4<<10)
 
 	var req CheckRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil {
 		http.Error(w, "Некорректный JSON", http.StatusBadRequest)
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		http.Error(w, "В теле должен быть ровно один JSON-объект", http.StatusBadRequest)
 		return
 	}
 	targetURL := strings.TrimSpace(req.URL)
@@ -532,6 +656,7 @@ func apiDomainHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initTrustedDomains()
+	initThreatIntel()
 	go initRDAPBootstrap()
 
 	tmpl := template.Must(template.ParseFiles(filepath.Join("templates", "index.html")))
@@ -554,6 +679,10 @@ func main() {
 	mux.HandleFunc("/api/check", apiCheckHandler)
 	mux.HandleFunc("/api/domain", apiDomainHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
+			return
+		}
 		_, _ = w.Write([]byte("ok"))
 	})
 

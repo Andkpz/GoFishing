@@ -39,8 +39,15 @@
         button:hover { background-color: #0b5ed7; }
         button:disabled { background-color: #6c757d; cursor: not-allowed; }
         .loader { display: none; margin-top: 20px; color: #495057; font-size: 15px; }
-        .result-box { display: none; margin-top: 20px; padding: 20px; border-radius: 8px; }
+        .result-box {
+            display: none;
+            margin-top: 20px;
+            padding: 20px;
+            border-radius: 8px;
+            transition: background-color 0.25s ease, border-color 0.25s ease;
+        }
         .safe { background-color: #d1e7dd; color: #0f5132; border: 1px solid #badbcc; }
+        .warn { background-color: #fff3cd; color: #664d03; border: 1px solid #ffecb5; }
         .danger { background-color: #f8d7da; color: #842029; border: 1px solid #f5c2c7; }
         .result-title { font-weight: bold; font-size: 18px; margin-bottom: 10px; word-break: break-all; }
         .score { font-weight: bold; margin-bottom: 8px; }
@@ -53,6 +60,7 @@
         }
         .score-fill { height: 100%; width: 0; transition: width .3s ease; }
         .safe .score-fill { background-color: #198754; }
+        .warn .score-fill { background-color: #ffc107; }
         .danger .score-fill { background-color: #dc3545; }
         ul { margin: 0; padding-left: 20px; }
         li { margin-bottom: 5px; }
@@ -91,7 +99,7 @@
             display: none;
             margin-top: 12px;
             padding: 8px 10px;
-            background: #fff3cd;
+            background: rgba(255, 255, 255, 0.65);
             border: 1px solid #ffecb5;
             border-radius: 6px;
             color: #664d03;
@@ -141,6 +149,28 @@
         const PHISH_THRESHOLD    = 60;     // = phishingThreshold в main.go
 
         let runId = 0, baseResult = null, domainCtrl = null;
+        let currentSslStatus = '', currentWhoisStatus = '';
+        let isCurrentPhish = false, currentUrl = '';
+
+        // Статусы невалидного или неподтверждённого сертификата/домена
+        const BAD_SSL_STATUSES   = new Set(['invalid', 'no_tls', 'no_dns', 'unknown', 'skipped', 'blocked']);
+        const BAD_WHOIS_STATUSES = new Set(['not_found', 'unknown', 'limited', 'skipped']);
+
+        function updateResultBoxStyle() {
+            const hasWarning = BAD_SSL_STATUSES.has(currentSslStatus) ||
+                               BAD_WHOIS_STATUSES.has(currentWhoisStatus);
+
+            if (isCurrentPhish) {
+                resultBox.className = 'result-box danger';
+                resultTitle.textContent = '⚠️ Обнаружен высокий риск фишинга: ' + currentUrl;
+            } else if (hasWarning) {
+                resultBox.className = 'result-box warn';
+                resultTitle.textContent = '⚠️ Результат для: ' + currentUrl;
+            } else {
+                resultBox.className = 'result-box safe';
+                resultTitle.textContent = '✅ Результат для: ' + currentUrl;
+            }
+        }
 
         const SSL_VIEW = {
             ok:      { icon: '🔒', cls: 'ssl-ok',    title: 'TLS-сертификат валиден' },
@@ -170,6 +200,11 @@
         });
 
         function hideResult() {
+            currentSslStatus = '';
+            currentWhoisStatus = '';
+            isCurrentPhish = false;
+            currentUrl = '';
+
             resultBox.style.display = 'none';
             resultReasons.replaceChildren();
             sslBox.replaceChildren();
@@ -181,26 +216,6 @@
             baseResult = null;
             if (domainCtrl) { domainCtrl.abort(); domainCtrl = null; }
         }
-
-        function li(text) {
-            const item = document.createElement('li');
-            item.textContent = text; // только textContent: часть строк приходит из чужих сертификатов и whois
-            return item;
-        }
-
-        function fmtDate(iso) {
-            const d = new Date(iso);
-            return isNaN(d.getTime())
-                ? iso
-                : d.toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric' });
-        }
-
-        function formatAge(days) {
-            if (days < 60) return days + ' дн.';
-            if (days < 730) return Math.round(days / 30) + ' мес.';
-            return (days / 365).toFixed(1) + ' лет';
-        }
-
         async function checkURL() {
             const url = urlInput.value.trim();
             if (!url || checkBtn.disabled) return;
@@ -254,10 +269,8 @@
         }
 
         function renderResult(data) {
-            resultBox.className = 'result-box ' + (data.is_phish ? 'danger' : 'safe');
-            resultTitle.textContent = (data.is_phish
-                ? '⚠️ Обнаружен высокий риск фишинга: '
-                : '✅ Результат для: ') + data.url;
+            isCurrentPhish = Boolean(data.is_phish);
+            currentUrl = data.url;
 
             const score = Math.max(0, Math.min(100, Number(data.score) || 0));
             resultScore.textContent = `Оценка риска: ${score} / 100`;
@@ -269,12 +282,15 @@
             resultReasons.replaceChildren(...reasons.map(li));
 
             renderSSL(data);
+            updateResultBoxStyle();
             resultBox.style.display = 'block';
         }
 
         function renderSSL(data) {
             const ssl = data.ssl || null;
             const status = data.ssl_status || (ssl && ssl.status) || '';
+            currentSslStatus = status;
+            updateResultBoxStyle();
 
             sslBox.replaceChildren();
             incompleteNote.style.display = 'none';
@@ -339,7 +355,6 @@
                 incompleteNote.style.display = 'block';
             }
         }
-
         async function maybeFetchDomain(data, run) {
             if (!data.domain || data.whois_status !== 'pending') return;
             baseResult = data;
@@ -371,6 +386,9 @@
         }
 
         function renderWhois(info) {
+            currentWhoisStatus = info.status || '';
+            updateResultBoxStyle();
+
             const view = WHOIS_VIEW[info.status] || WHOIS_VIEW.unknown;
             let cls = view.cls, title = view.title;
             if (info.status === 'ok' && info.created) {
@@ -395,7 +413,6 @@
             if (info.created) meta.push('Зарегистрирован: ' + fmtDate(info.created));
             if (info.expires) meta.push('Оплачен до: ' + fmtDate(info.expires));
             if (info.registrar) meta.push('Регистратор: ' + info.registrar);
-            if (info.source) meta.push('Источник: ' + info.source);
             if (meta.length) {
                 const m = document.createElement('div');
                 m.className = 'ssl-meta';
@@ -411,13 +428,13 @@
             }
 
             if (info.detail) {
-                const d = document.createElement('details');
-                const s = document.createElement('summary');
-                s.textContent = 'Технические подробности';
-                const c = document.createElement('code');
-                c.textContent = info.detail;
-                d.append(s, c);
-                whoisBox.appendChild(d);
+                const details = document.createElement('details');
+                const summary = document.createElement('summary');
+                summary.textContent = 'Технические подробности';
+                const code = document.createElement('code');
+                code.textContent = info.detail;
+                details.append(summary, code);
+                whoisBox.appendChild(details);
             }
 
             whoisBox.style.display = 'block';
@@ -425,21 +442,44 @@
 
         function applyDomainScore(info) {
             if (!baseResult) return;
-            const total = Math.max(0, Math.min(100,
-                (Number(baseResult.score) || 0) + (Number(info.score) || 0)));
-            const phish = total >= PHISH_THRESHOLD;
+            const addScore = Number(info.score) || 0;
+            const extraReasons = Array.isArray(info.reasons) ? info.reasons : [];
+            if (addScore === 0 && extraReasons.length === 0) return;
 
-            resultBox.className = 'result-box ' + (phish ? 'danger' : 'safe');
-            resultTitle.textContent = (phish
-                ? '⚠️ Обнаружен высокий риск фишинга: '
-                : '✅ Результат для: ') + baseResult.url;
-            resultScore.textContent = `Оценка риска: ${total} / 100 (уточнено по данным реестра)`;
-            scoreFill.style.width = total + '%';
+            const totalScore = Math.max(0, Math.min(100, (Number(baseResult.score) || 0) + addScore));
+            isCurrentPhish = baseResult.is_phish || totalScore >= PHISH_THRESHOLD;
+            updateResultBoxStyle();
 
-            const reasons = [...(baseResult.reasons || []), ...(info.reasons || [])];
-            resultReasons.replaceChildren(...(reasons.length
-                ? reasons : ['Подозрительных признаков не обнаружено.']).map(li));
+            resultScore.textContent = `Оценка риска: ${totalScore} / 100`;
+            scoreFill.style.width = totalScore + '%';
+
+            const baseReasons = (baseResult.reasons && baseResult.reasons.length) ? baseResult.reasons : [];
+            const allReasons = [...baseReasons, ...extraReasons];
+            if (allReasons.length) {
+                resultReasons.replaceChildren(...allReasons.map(li));
+            }
+        }
+
+        function fmtDate(val) {
+            const d = new Date(val);
+            if (isNaN(d.getTime())) return String(val);
+            return d.toLocaleDateString('ru-RU');
+        }
+
+        function formatAge(days) {
+            if (days < 30) return days + ' дн.';
+            if (days < 365) return Math.floor(days / 30) + ' мес.';
+            const years = Math.floor(days / 365);
+            const remDays = days % 365;
+            return years + ' г.' + (remDays >= 30 ? ' ' + Math.floor(remDays / 30) + ' мес.' : '');
+        }
+
+        function li(text) {
+            const item = document.createElement('li');
+            item.textContent = text;
+            return item;
         }
     </script>
+
 </body>
 </html>
