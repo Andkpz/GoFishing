@@ -31,6 +31,15 @@ type CheckRequest struct {
 	URL string `json:"url"`
 }
 
+type RedirectReport struct {
+	Checked      bool     `json:"checked"`
+	FinalURL     string   `json:"final_url,omitempty"`
+	Chain        []string `json:"chain,omitempty"`
+	Count        int      `json:"count"`
+	ExternalHost bool     `json:"external_host,omitempty"`
+	Error        string   `json:"error,omitempty"`
+}
+
 type CheckResult struct {
 	URL         string             `json:"url"`
 	IsPhish     bool               `json:"is_phish"`
@@ -41,6 +50,7 @@ type CheckResult struct {
 	SSL         *SSLReport         `json:"ssl,omitempty"`
 	WhoisStatus string             `json:"whois_status,omitempty"`
 	ThreatIntel *ThreatIntelReport `json:"threat_intel,omitempty"`
+	Redirects   *RedirectReport    `json:"redirects,omitempty"`
 }
 
 var (
@@ -386,34 +396,230 @@ func levenshteinDistance(a, b string) int {
 	return prev[m]
 }
 
+// confusableASCII сводит распространённые кириллические и греческие омоглифы
+// к латинским буквам. Это эвристика, а не полноценный Unicode confusables.txt.
+var confusableASCII = map[rune]rune{
+	'а': 'a', 'А': 'a', 'ɑ': 'a', 'α': 'a', 'Α': 'a',
+	'в': 'b', 'Β': 'b', 'β': 'b',
+	'с': 'c', 'С': 'c', 'ϲ': 'c',
+	'ԁ': 'd', 'ժ': 'd',
+	'е': 'e', 'Е': 'e', 'ε': 'e', 'Ε': 'e',
+	'ғ': 'f', 'Ϝ': 'f',
+	'ɡ': 'g', 'ց': 'g',
+	'һ': 'h', 'Н': 'h', 'Η': 'h',
+	'і': 'i', 'І': 'i', 'ι': 'i', 'Ι': 'i', 'ӏ': 'i',
+	'ј': 'j', 'ϳ': 'j',
+	'κ': 'k', 'Κ': 'k', 'к': 'k', 'К': 'k',
+	'ⅼ': 'l',
+	'м': 'm', 'М': 'm', 'Μ': 'm',
+	'ո': 'n', 'п': 'n', 'Ν': 'n',
+	'о': 'o', 'О': 'o', 'ο': 'o', 'Ο': 'o', 'օ': 'o',
+	'р': 'p', 'Р': 'p', 'ρ': 'p', 'Ρ': 'p',
+	'զ': 'q',
+	'г': 'r', 'Γ': 'r',
+	'ѕ': 's', 'Ѕ': 's',
+	'т': 't', 'Т': 't', 'τ': 't', 'Τ': 't',
+	'υ': 'u', 'ս': 'u',
+	'ν': 'v', 'ѵ': 'v', 'Ⅴ': 'v',
+	'ԝ': 'w', 'ω': 'w', 'ώ': 'w',
+	'х': 'x', 'Х': 'x', 'χ': 'x', 'Χ': 'x',
+	'у': 'y', 'У': 'y', 'γ': 'y',
+	'ᴢ': 'z', 'Ζ': 'z',
+}
+
+func confusableSkeleton(value string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(value) {
+		if mapped, ok := confusableASCII[r]; ok {
+			b.WriteRune(mapped)
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func scriptFlags(value string) (latin, cyrillic, greek bool) {
+	for _, r := range value {
+		switch {
+		case r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z':
+			latin = true
+		case r >= 0x0400 && r <= 0x052F:
+			cyrillic = true
+		case r >= 0x0370 && r <= 0x03FF:
+			greek = true
+		}
+	}
+	return
+}
+
+// damerauLevenshtein учитывает также перестановку соседних символов.
+func damerauLevenshtein(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	n, m := len(ra), len(rb)
+	d := make([][]int, n+1)
+	for i := range d {
+		d[i] = make([]int, m+1)
+		d[i][0] = i
+	}
+	for j := 0; j <= m; j++ {
+		d[0][j] = j
+	}
+	for i := 1; i <= n; i++ {
+		for j := 1; j <= m; j++ {
+			cost := 0
+			if ra[i-1] != rb[j-1] {
+				cost = 1
+			}
+			d[i][j] = minInt(d[i-1][j]+1, d[i][j-1]+1, d[i-1][j-1]+cost)
+			if i > 1 && j > 1 && ra[i-1] == rb[j-2] && ra[i-2] == rb[j-1] && d[i][j] > d[i-2][j-2]+1 {
+				d[i][j] = d[i-2][j-2] + 1
+			}
+		}
+	}
+	return d[n][m]
+}
+
+func minInt(values ...int) int {
+	m := values[0]
+	for _, v := range values[1:] {
+		if v < m {
+			m = v
+		}
+	}
+	return m
+}
+
 func checkTyposquatting(domainLabel string) (int, string) {
-	if len(domainLabel) < 3 {
+	label := strings.Trim(domainLabel, "-")
+	if len([]rune(label)) < 3 {
 		return 0, ""
 	}
+	latin, cyrillic, greek := scriptFlags(label)
+	skeleton := confusableSkeleton(label)
 	brandKeys := make([]string, 0, len(protectedBrands))
 	for key := range protectedBrands {
 		brandKeys = append(brandKeys, key)
 	}
 	sort.Strings(brandKeys)
-	bestDist := math.MaxInt
-	bestBrand := ""
-	for _, brandKey := range brandKeys {
-		if domainLabel == brandKey {
+	bestDist, bestBrand := math.MaxInt, ""
+	bestHomoglyph := false
+	for _, brand := range brandKeys {
+		if label == brand {
 			continue
 		}
+		brandSkeleton := confusableSkeleton(brand)
+		if skeleton == brandSkeleton {
+			bestDist, bestBrand, bestHomoglyph = 0, brand, true
+			break
+		}
+		dist := damerauLevenshtein(skeleton, brand)
 		maxDist := 1
-		if len([]rune(brandKey)) >= 7 {
+		if len([]rune(brand)) >= 7 {
 			maxDist = 2
 		}
-		dist := levenshteinDistance(domainLabel, brandKey)
-		if dist > 0 && dist <= maxDist && dist < bestDist {
-			bestDist, bestBrand = dist, brandKey
+		// Не штрафуем сильно отличающиеся по длине слова только за случайную схожесть.
+		if dist > 0 && dist <= maxDist && dist < bestDist && len([]rune(label)) >= len([]rune(brand))-2 && len([]rune(label)) <= len([]rune(brand))+2 {
+			bestDist, bestBrand, bestHomoglyph = dist, brand, false
 		}
 	}
 	if bestBrand != "" {
-		return 55, fmt.Sprintf("Возможный тайпсквоттинг: домен '%s' подозрительно похож на бренд %s (разница в %d симв.).", domainLabel, protectedBrands[bestBrand], bestDist)
+		if bestHomoglyph {
+			return 65, fmt.Sprintf("Обнаружена возможная homoglyph-подмена бренда %s: доменная метка '%s' визуально имитирует название бренда.", protectedBrands[bestBrand], label)
+		}
+		return 50, fmt.Sprintf("Возможный тайпсквоттинг: домен '%s' похож на бренд %s (расстояние редактирования: %d).", label, protectedBrands[bestBrand], bestDist)
+	}
+	if (latin && cyrillic) || (latin && greek) || (cyrillic && greek) {
+		return 25, fmt.Sprintf("В доменной метке '%s' смешаны разные письменности; это может использоваться для визуальной подмены символов.", label)
 	}
 	return 0, ""
+}
+
+const (
+	redirectMaxHops = 5
+	redirectMaxBody = 64 << 10
+)
+
+// inspectRedirects следует редиректам только через публичные IP-адреса.
+// Автоматическое выполнение JavaScript/meta-refresh не производится.
+func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
+	report := RedirectReport{Checked: true, Chain: []string{}}
+	start, err := url.Parse(startURL)
+	if err != nil {
+		report.Error = "Некорректный URL"
+		return report
+	}
+	startHost, normErr := normalizeHost(start.Hostname())
+	if normErr != nil {
+		report.Error = "Некорректное имя хоста"
+		return report
+	}
+	if port := start.Port(); port != "" {
+		start.Host = net.JoinHostPort(startHost, port)
+	} else {
+		start.Host = startHost
+	}
+	chain := []string{start.String()}
+	client := &http.Client{
+		Timeout: 900 * time.Millisecond,
+		Transport: &http.Transport{
+			Proxy: nil,
+			DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+				host, port, splitErr := net.SplitHostPort(address)
+				if splitErr != nil {
+					return nil, splitErr
+				}
+				return dialPublicTCP(dialCtx, host, port)
+			},
+			TLSHandshakeTimeout:   500 * time.Millisecond,
+			ResponseHeaderTimeout: 500 * time.Millisecond,
+			DisableKeepAlives:     true,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) > redirectMaxHops {
+				return fmt.Errorf("превышен лимит редиректов (%d)", redirectMaxHops)
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return fmt.Errorf("запрещённая схема редиректа")
+			}
+			if req.URL.User != nil {
+				return fmt.Errorf("userinfo в адресе редиректа")
+			}
+			chain = append(chain, req.URL.String())
+			return nil
+		},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, start.String(), nil)
+	if err != nil {
+		report.Error = err.Error()
+		return report
+	}
+	req.Header.Set("User-Agent", "PhishDetector/1.0")
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", redirectMaxBody-1))
+	resp, err := client.Do(req)
+	if err != nil {
+		report.Chain = chain
+		report.Count = len(chain) - 1
+		if len(chain) > 1 {
+			report.FinalURL = chain[len(chain)-1]
+			if last, parseErr := url.Parse(report.FinalURL); parseErr == nil {
+				report.ExternalHost = !strings.EqualFold(startHost, last.Hostname())
+			}
+			report.Error = err.Error()
+		} else {
+			report.Error = "Не удалось безопасно получить ответ: " + err.Error()
+		}
+		return report
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, redirectMaxBody))
+	_ = resp.Body.Close()
+	report.Chain = chain
+	report.Count = len(chain) - 1
+	if resp.Request != nil && resp.Request.URL != nil {
+		report.FinalURL = resp.Request.URL.String()
+		report.ExternalHost = !strings.EqualFold(startHost, resp.Request.URL.Hostname())
+	}
+	return report
 }
 
 func analyzeURL(ctx context.Context, rawURL string) CheckResult {
@@ -498,7 +704,11 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' присутствует в рейтинге популярных сайтов; остальные проверки всё равно выполнены.", rootDomain))
 	}
 
-	domainLabel, _, _ := strings.Cut(rootDomain, ".")
+	unicodeRoot, unicodeErr := idna.ToUnicode(rootDomain)
+	if unicodeErr != nil {
+		unicodeRoot = rootDomain
+	}
+	domainLabel, _, _ := strings.Cut(unicodeRoot, ".")
 
 	if !isIP && !urlShorteners[rootDomain] {
 		if typoScore, typoReason := checkTyposquatting(domainLabel); typoScore > 0 {
@@ -573,6 +783,23 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		keywordScore = 30
 	}
 	res.Score += keywordScore
+
+	// Анализируем HTTP-редиректы с ограничением по времени, числу переходов
+	// и безопасным исходящим соединением только к публичным IP.
+	redirectCtx, redirectCancel := context.WithTimeout(ctx, 900*time.Millisecond)
+	redirectReport := inspectRedirects(redirectCtx, urlToParse)
+	redirectCancel()
+	res.Redirects = &redirectReport
+	if redirectReport.Count >= 2 {
+		res.Score += 20
+		res.Reasons = append(res.Reasons, fmt.Sprintf("Обнаружена цепочка из %d HTTP-редиректов; длинные цепочки могут скрывать конечный адрес.", redirectReport.Count))
+	} else if redirectReport.Count == 1 && redirectReport.ExternalHost {
+		res.Score += 10
+		res.Reasons = append(res.Reasons, "URL перенаправляет на другой домен; проверьте конечный адрес.")
+	}
+	if redirectReport.Error != "" && len(redirectReport.Chain) > 1 {
+		res.Reasons = append(res.Reasons, "Не удалось полностью проверить цепочку редиректов: "+redirectReport.Error)
+	}
 
 	// TLS-проба — только если вердикт ещё не определён. Максимум sslMaxScore (35) баллов,
 	// то есть сама по себе она никогда не даёт «фишинг».

@@ -151,6 +151,7 @@
         let runId = 0, baseResult = null, domainCtrl = null;
         let currentSslStatus = '', currentWhoisStatus = '';
         let isCurrentPhish = false, currentUrl = '';
+        let isYoungDomain = false;
 
         // Статусы невалидного или неподтверждённого сертификата/домена
         const BAD_SSL_STATUSES   = new Set(['invalid', 'no_tls', 'no_dns', 'unknown', 'skipped', 'blocked']);
@@ -158,7 +159,8 @@
 
         function updateResultBoxStyle() {
             const hasWarning = BAD_SSL_STATUSES.has(currentSslStatus) ||
-                               BAD_WHOIS_STATUSES.has(currentWhoisStatus);
+                               BAD_WHOIS_STATUSES.has(currentWhoisStatus) ||
+                               isYoungDomain;
 
             if (isCurrentPhish) {
                 resultBox.className = 'result-box danger';
@@ -203,6 +205,7 @@
             currentSslStatus = '';
             currentWhoisStatus = '';
             isCurrentPhish = false;
+            isYoungDomain = false;
             currentUrl = '';
 
             resultBox.style.display = 'none';
@@ -387,13 +390,14 @@
 
         function renderWhois(info) {
             currentWhoisStatus = info.status || '';
+            isYoungDomain = (info.status === 'ok' && Boolean(info.created) && Number(info.age_days) < 3);
             updateResultBoxStyle();
 
             const view = WHOIS_VIEW[info.status] || WHOIS_VIEW.unknown;
             let cls = view.cls, title = view.title;
             if (info.status === 'ok' && info.created) {
                 title = 'Возраст домена: ' + formatAge(info.age_days || 0);
-                cls = info.score >= 25 ? 'ssl-bad' : (info.score > 0 ? 'ssl-warn' : 'ssl-ok');
+                cls = info.score >= 25 ? 'ssl-bad' : ((info.score > 0 || isYoungDomain) ? 'ssl-warn' : 'ssl-ok');
             }
             whoisBox.className = 'ssl-box ' + cls;
             whoisBox.replaceChildren();
@@ -480,6 +484,7 @@
             return item;
         }
     </script>
+
 
 </body>
 </html>
