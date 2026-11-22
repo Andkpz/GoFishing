@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/net/idna"
@@ -61,49 +62,58 @@ var (
 		"bit.ly": true, "tinyurl.com": true, "clck.ru": true, "t.co": true,
 		"goo.gl": true, "is.gd": true, "vk.cc": true, "cutt.ly": true, "ow.ly": true,
 	}
+
 	untrustedPlatforms = map[string]bool{
 		"blogspot.com": true,
 	}
 
 	protectedBrands = map[string]string{
-		"google":      "Google",
-		"youtube":     "YouTube",
-		"facebook":    "Facebook",
-		"amazon":      "Amazon",
-		"instagram":   "Instagram",
-		"linkedin":    "LinkedIn",
-		"netflix":     "Netflix",
-		"microsoft":   "Microsoft",
-		"apple":       "Apple",
-		"github":      "GitHub",
-		"paypal":      "PayPal",
-		"telegram":    "Telegram",
-		"whatsapp":    "WhatsApp",
-		"yandex":      "Яндекс",
-		"sberbank":    "Сбербанк",
-		"sber":        "Сбер",
-		"tbank":       "Т-Банк",
-		"tinkoff":     "Тинькофф",
-		"vtb":         "ВТБ",
-		"alfabank":    "Альфа-Банк",
-		"gazprombank": "Газпромбанк",
-		"gosuslugi":   "Госуслуги",
-		"nalog":       "ФНС России",
-		"wildberries": "Wildberries",
-		"ozon":        "Ozon",
-		"avito":       "Авито",
-		"mail":        "Mail.ru",
+		"google": "Google", "youtube": "YouTube", "facebook": "Facebook",
+		"amazon": "Amazon", "instagram": "Instagram", "linkedin": "LinkedIn",
+		"netflix": "Netflix", "microsoft": "Microsoft", "apple": "Apple",
+		"github": "GitHub", "paypal": "PayPal", "telegram": "Telegram",
+		"whatsapp": "WhatsApp", "yandex": "Яндекс", "sberbank": "Сбербанк",
+		"sber": "Сбер", "tbank": "Т-Банк", "tinkoff": "Тинькофф", "vtb": "ВТБ",
+		"alfabank": "Альфа-Банк", "gazprombank": "Газпромбанк", "gosuslugi": "Госуслуги",
+		"nalog": "ФНС России", "wildberries": "Wildberries", "ozon": "Ozon",
+		"avito": "Авито", "mail": "Mail.ru",
 	}
 
-	// Оба зеркала — один и тот же файл, но разные хосты:
-	// github.com/.../raw/... отдаёт редирект, raw.githubusercontent.com — сразу тело.
 	cruxMirrors = []string{
 		"https://github.com/zakird/crux-top-lists/raw/main/data/country/ru/202104.csv.gz",
 		"https://raw.githubusercontent.com/zakird/crux-top-lists/main/data/country/ru/202104.csv.gz",
 	}
 
-	trustedDomains = make(map[string]bool)
-	domainsMutex   sync.RWMutex
+	// ОПТИМИЗАЦИЯ: Используем atomic pointer для lock-free чтения белого списка
+	trustedDomainsPtr atomic.Value // хранит *map[string]bool
+
+	compiledBrands []struct {
+		name     string
+		skeleton string
+		length   int
+	}
+
+	redirectTransport = &http.Transport{
+		Proxy:                 nil,
+		DisableKeepAlives:     false,
+		TLSHandshakeTimeout:   500 * time.Millisecond,
+		ResponseHeaderTimeout: 500 * time.Millisecond,
+		MaxIdleConns:          100,
+		MaxIdleConnsPerHost:   20,
+		IdleConnTimeout:       30 * time.Second,
+		DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
+			host, port, splitErr := net.SplitHostPort(address)
+			if splitErr != nil {
+				return nil, splitErr
+			}
+			return dialPublicTCP(dialCtx, host, port)
+		},
+	}
+
+	// Кэш результатов проверки
+	resultCache     = make(map[string]CheckResult)
+	cacheMutex      sync.RWMutex
+	cacheExpiration = 10 * time.Minute
 )
 
 const (
@@ -120,27 +130,49 @@ func initTrustedDomains() {
 		"yandex.ru", "vk.com", "mail.ru", "sberbank.ru", "tbank.ru", "gosuslugi.ru",
 	}
 
-	domainsMutex.Lock()
+	initialMap := make(map[string]bool)
 	for _, d := range fallback {
-		trustedDomains[d] = true
+		initialMap[d] = true
 	}
-	domainsMutex.Unlock()
+	trustedDomainsPtr.Store(&initialMap)
 
 	if info, err := os.Stat(cacheFile); err == nil && time.Since(info.ModTime()) < 7*24*time.Hour {
 		if loadDomainsFromFile(cacheFile) == nil {
-			log.Printf("Загружено %d доменов из локального кэша", len(trustedDomains))
+			log.Printf("Загружено доменов из локального кэша")
 			return
 		}
 	}
-
 	go func() {
 		log.Println("Загрузка мирового рейтинга доменов (Google CrUX)...")
 		if err := downloadAndCacheDomains(); err != nil {
-			log.Printf("Не удалось обновить мировой список доменов (используется базовый): %v", err)
+			log.Printf("Не удалось обновить мировой список доменов: %v", err)
 			return
 		}
-		log.Printf("Успешно загружено %d доменов в белый список", len(trustedDomains))
+		log.Printf("Успешно загружен новый белый список")
 	}()
+}
+
+func initProtectedBrands() {
+	compiledBrands = make([]struct {
+		name     string
+		skeleton string
+		length   int
+	}, 0, len(protectedBrands))
+
+	for key := range protectedBrands {
+		compiledBrands = append(compiledBrands, struct {
+			name     string
+			skeleton string
+			length   int
+		}{
+			name:     key,
+			skeleton: confusableSkeleton(key),
+			length:   len([]rune(key)),
+		})
+	}
+	sort.Slice(compiledBrands, func(i, j int) bool {
+		return compiledBrands[i].name < compiledBrands[j].name
+	})
 }
 
 func downloadAndCacheDomains() error {
@@ -162,7 +194,7 @@ func fetchFromURL(targetURL string) error {
 			if len(via) >= 5 {
 				return fmt.Errorf("слишком много редиректов")
 			}
-			if req.URL.Scheme != "https" || req.URL.Hostname() != "github.com" && req.URL.Hostname() != "raw.githubusercontent.com" {
+			if req.URL.Scheme != "https" || (req.URL.Hostname() != "github.com" && req.URL.Hostname() != "raw.githubusercontent.com") {
 				return fmt.Errorf("запрещённый адрес редиректа")
 			}
 			return nil
@@ -179,11 +211,11 @@ func fetchFromURL(targetURL string) error {
 		return err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("сервер вернул статус %d для %s", resp.StatusCode, targetURL)
+		return fmt.Errorf("сервер вернул статус %d", resp.StatusCode)
 	}
 
-	// Ограничиваем распакованный поток, чтобы повреждённый gzip не исчерпал память/диск.
 	gzReader, err := gzip.NewReader(io.LimitReader(resp.Body, 64<<20))
 	if err != nil {
 		return fmt.Errorf("ошибка распаковки GZIP: %w", err)
@@ -196,6 +228,7 @@ func fetchFromURL(targetURL string) error {
 	if err != nil {
 		return fmt.Errorf("не удалось прочитать CSV-заголовок: %w", err)
 	}
+
 	originColumn := -1
 	for i, field := range header {
 		if strings.EqualFold(strings.TrimSpace(field), "origin") {
@@ -209,6 +242,7 @@ func fetchFromURL(targetURL string) error {
 
 	newMap := make(map[string]bool, topDomainsLimit)
 	linesToCache := make([]string, 0, topDomainsLimit)
+
 	for len(linesToCache) < topDomainsLimit {
 		record, readErr := reader.Read()
 		if readErr == io.EOF {
@@ -222,7 +256,7 @@ func fetchFromURL(targetURL string) error {
 		}
 		rawOrigin := strings.TrimSpace(record[originColumn])
 		parsed, parseErr := url.Parse(rawOrigin)
-		if parseErr != nil || parsed.Scheme != "https" && parsed.Scheme != "http" || parsed.Hostname() == "" {
+		if parseErr != nil || (parsed.Scheme != "https" && parsed.Scheme != "http") || parsed.Hostname() == "" {
 			continue
 		}
 		host, normErr := normalizeHost(parsed.Hostname())
@@ -235,17 +269,18 @@ func fetchFromURL(targetURL string) error {
 			linesToCache = append(linesToCache, rootDomain)
 		}
 	}
+
 	if len(newMap) == 0 {
 		return fmt.Errorf("в ответе %s не найдено ни одного домена", targetURL)
 	}
 
-	// Сначала атомарно сохраняем, затем публикуем новый набор в памяти.
 	if err := writeDomainsAtomically(cacheFile, linesToCache); err != nil {
 		return fmt.Errorf("не удалось сохранить кэш доменов: %w", err)
 	}
-	domainsMutex.Lock()
-	trustedDomains = newMap
-	domainsMutex.Unlock()
+
+	// Атомарная замена указателя на мапу (Lock-Free для читателей)
+	trustedDomainsPtr.Store(&newMap)
+
 	return nil
 }
 
@@ -266,6 +301,7 @@ func writeDomainsAtomically(filename string, domains []string) error {
 			_ = os.Remove(tmp)
 		}
 	}()
+
 	if _, err = f.WriteString(strings.Join(domains, "\n") + "\n"); err != nil {
 		return err
 	}
@@ -289,23 +325,27 @@ func loadDomainsFromFile(filename string) error {
 	}
 	defer file.Close()
 
-	domainsMutex.Lock()
-	defer domainsMutex.Unlock()
-
 	scanner := bufio.NewScanner(file)
+	tempMap := make(map[string]bool)
 	for scanner.Scan() {
 		domain := strings.TrimSpace(scanner.Text())
 		if domain != "" && !urlShorteners[domain] {
-			trustedDomains[domain] = true
+			tempMap[domain] = true
 		}
 	}
-	return scanner.Err()
+	if err := scanner.Err(); err != nil {
+		return err
+	}
+
+	// Обновляем глобальный указатель
+	trustedDomainsPtr.Store(&tempMap)
+	return nil
 }
 
 func isTrustedDomain(domain string) bool {
-	domainsMutex.RLock()
-	defer domainsMutex.RUnlock()
-	return trustedDomains[domain]
+	// Lock-free чтение: получаем текущую версию мапы
+	ptr := trustedDomainsPtr.Load().(*map[string]bool)
+	return (*ptr)[domain]
 }
 
 func calculateEntropy(s string) float64 {
@@ -351,8 +391,6 @@ func getRootDomain(host string) string {
 	}
 	root, err := publicsuffix.EffectiveTLDPlusOne(host)
 	if err != nil {
-		// Для localhost и неизвестных внутренних имён возвращаем сам host;
-		// такие значения не должны автоматически становиться доверенными.
 		return host
 	}
 	return root
@@ -396,8 +434,6 @@ func levenshteinDistance(a, b string) int {
 	return prev[m]
 }
 
-// confusableASCII сводит распространённые кириллические и греческие омоглифы
-// к латинским буквам. Это эвристика, а не полноценный Unicode confusables.txt.
 var confusableASCII = map[rune]rune{
 	'а': 'a', 'А': 'a', 'ɑ': 'a', 'α': 'a', 'Α': 'a',
 	'в': 'b', 'Β': 'b', 'β': 'b',
@@ -453,7 +489,6 @@ func scriptFlags(value string) (latin, cyrillic, greek bool) {
 	return
 }
 
-// damerauLevenshtein учитывает также перестановку соседних символов.
 func damerauLevenshtein(a, b string) int {
 	ra, rb := []rune(a), []rune(b)
 	n, m := len(ra), len(rb)
@@ -497,32 +532,29 @@ func checkTyposquatting(domainLabel string) (int, string) {
 	}
 	latin, cyrillic, greek := scriptFlags(label)
 	skeleton := confusableSkeleton(label)
-	brandKeys := make([]string, 0, len(protectedBrands))
-	for key := range protectedBrands {
-		brandKeys = append(brandKeys, key)
-	}
-	sort.Strings(brandKeys)
+
 	bestDist, bestBrand := math.MaxInt, ""
 	bestHomoglyph := false
-	for _, brand := range brandKeys {
-		if label == brand {
+
+	for _, brand := range compiledBrands {
+		if label == brand.name {
 			continue
 		}
-		brandSkeleton := confusableSkeleton(brand)
-		if skeleton == brandSkeleton {
-			bestDist, bestBrand, bestHomoglyph = 0, brand, true
+		if skeleton == brand.skeleton {
+			bestDist, bestBrand, bestHomoglyph = 0, brand.name, true
 			break
 		}
-		dist := damerauLevenshtein(skeleton, brand)
+		dist := damerauLevenshtein(skeleton, brand.name)
 		maxDist := 1
-		if len([]rune(brand)) >= 7 {
+		if brand.length >= 7 {
 			maxDist = 2
 		}
-		// Не штрафуем сильно отличающиеся по длине слова только за случайную схожесть.
-		if dist > 0 && dist <= maxDist && dist < bestDist && len([]rune(label)) >= len([]rune(brand))-2 && len([]rune(label)) <= len([]rune(brand))+2 {
-			bestDist, bestBrand, bestHomoglyph = dist, brand, false
+		labelLen := len([]rune(label))
+		if dist > 0 && dist <= maxDist && dist < bestDist && labelLen >= brand.length-2 && labelLen <= brand.length+2 {
+			bestDist, bestBrand, bestHomoglyph = dist, brand.name, false
 		}
 	}
+
 	if bestBrand != "" {
 		if bestHomoglyph {
 			return 65, fmt.Sprintf("Обнаружена возможная homoglyph-подмена бренда %s: доменная метка '%s' визуально имитирует название бренда.", protectedBrands[bestBrand], label)
@@ -540,8 +572,6 @@ const (
 	redirectMaxBody = 64 << 10
 )
 
-// inspectRedirects следует редиректам только через публичные IP-адреса.
-// Автоматическое выполнение JavaScript/meta-refresh не производится.
 func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 	report := RedirectReport{Checked: true, Chain: []string{}}
 	start, err := url.Parse(startURL)
@@ -559,22 +589,12 @@ func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 	} else {
 		start.Host = startHost
 	}
+
 	chain := []string{start.String()}
+
 	client := &http.Client{
-		Timeout: 900 * time.Millisecond,
-		Transport: &http.Transport{
-			Proxy: nil,
-			DialContext: func(dialCtx context.Context, network, address string) (net.Conn, error) {
-				host, port, splitErr := net.SplitHostPort(address)
-				if splitErr != nil {
-					return nil, splitErr
-				}
-				return dialPublicTCP(dialCtx, host, port)
-			},
-			TLSHandshakeTimeout:   500 * time.Millisecond,
-			ResponseHeaderTimeout: 500 * time.Millisecond,
-			DisableKeepAlives:     true,
-		},
+		Timeout:   900 * time.Millisecond,
+		Transport: redirectTransport,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) > redirectMaxHops {
 				return fmt.Errorf("превышен лимит редиректов (%d)", redirectMaxHops)
@@ -589,6 +609,7 @@ func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 			return nil
 		},
 	}
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, start.String(), nil)
 	if err != nil {
 		report.Error = err.Error()
@@ -596,6 +617,7 @@ func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 	}
 	req.Header.Set("User-Agent", "PhishDetector/1.0")
 	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", redirectMaxBody-1))
+
 	resp, err := client.Do(req)
 	if err != nil {
 		report.Chain = chain
@@ -611,8 +633,10 @@ func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 		}
 		return report
 	}
+
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, redirectMaxBody))
 	_ = resp.Body.Close()
+
 	report.Chain = chain
 	report.Count = len(chain) - 1
 	if resp.Request != nil && resp.Request.URL != nil {
@@ -624,11 +648,19 @@ func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 
 func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 	cleanURL := strings.TrimSpace(rawURL)
+
+	// Проверка кэша
+	cacheMutex.RLock()
+	if cached, found := resultCache[cleanURL]; found {
+		cacheMutex.RUnlock()
+		return cached
+	}
+	cacheMutex.RUnlock()
+
 	res := CheckResult{
 		URL:     cleanURL,
 		Reasons: []string{},
 	}
-
 	if cleanURL == "" {
 		res.IsPhish = true
 		res.Score = 100
@@ -655,6 +687,7 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Разрешены только схемы http и https.")
 		return res
 	}
+
 	host, err := normalizeHost(parsed.Hostname())
 	if err != nil {
 		res.IsPhish = true
@@ -671,10 +704,26 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 			return res
 		}
 	}
+
 	rootDomain := getRootDomain(host)
 	isIP := net.ParseIP(host) != nil || numericHostRegex.MatchString(host)
-	// Threat Intelligence: точное совпадение с известными фишинговыми URL.
-	// Внешняя проверка ограничена контекстом запроса и не блокирует эвристики при сбое провайдера.
+
+	// Ранний возврат для доверенных доменов
+	trusted := !isIP && !untrustedPlatforms[rootDomain] && isTrustedDomain(rootDomain)
+	if trusted {
+		res.Domain = rootDomain
+		res.IsPhish = false
+		res.Score = 0
+		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' присутствует в рейтинге популярных сайтов и автоматически считается безопасным.", rootDomain))
+
+		// Сохраняем в кэш
+		cacheMutex.Lock()
+		resultCache[cleanURL] = res
+		cacheMutex.Unlock()
+
+		return res
+	}
+
 	intel := checkThreatIntel(ctx, urlToParse)
 	res.ThreatIntel = &intel
 	if intel.Status == "hit" {
@@ -687,7 +736,6 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, intel.Reasons...)
 	}
 
-	// Возраст домена уточняется отдельным асинхронным запросом /api/domain.
 	res.Domain = rootDomain
 	if !isIP && !urlShorteners[rootDomain] && validDomain(rootDomain) {
 		res.WhoisStatus = "pending"
@@ -695,14 +743,7 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 
 	authority := parsed.Host
 	decodedAuthority, decodeErr := url.QueryUnescape(authority)
-	hasAtTrick := strings.Contains(authority, "%40") || decodeErr == nil && strings.Contains(decodedAuthority, "@")
-
-	trusted := !isIP && !untrustedPlatforms[rootDomain] && isTrustedDomain(rootDomain)
-	if trusted {
-		// Популярность домена — только справочная информация, не доказательство
-		// безопасности конкретного URL и не основание пропускать проверки.
-		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' присутствует в рейтинге популярных сайтов; остальные проверки всё равно выполнены.", rootDomain))
-	}
+	hasAtTrick := strings.Contains(authority, "%40") || (decodeErr == nil && strings.Contains(decodedAuthority, "@"))
 
 	unicodeRoot, unicodeErr := idna.ToUnicode(rootDomain)
 	if unicodeErr != nil {
@@ -784,12 +825,11 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 	}
 	res.Score += keywordScore
 
-	// Анализируем HTTP-редиректы с ограничением по времени, числу переходов
-	// и безопасным исходящим соединением только к публичным IP.
 	redirectCtx, redirectCancel := context.WithTimeout(ctx, 900*time.Millisecond)
 	redirectReport := inspectRedirects(redirectCtx, urlToParse)
 	redirectCancel()
 	res.Redirects = &redirectReport
+
 	if redirectReport.Count >= 2 {
 		res.Score += 20
 		res.Reasons = append(res.Reasons, fmt.Sprintf("Обнаружена цепочка из %d HTTP-редиректов; длинные цепочки могут скрывать конечный адрес.", redirectReport.Count))
@@ -801,8 +841,6 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Не удалось полностью проверить цепочку редиректов: "+redirectReport.Error)
 	}
 
-	// TLS-проба — только если вердикт ещё не определён. Максимум sslMaxScore (35) баллов,
-	// то есть сама по себе она никогда не даёт «фишинг».
 	if !isIP && !urlShorteners[rootDomain] && res.Score < phishingThreshold {
 		rep := checkSSL(ctx, host)
 		res.SSL = &rep
@@ -815,6 +853,12 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 	if res.Score > 100 {
 		res.Score = 100
 	}
+
+	// Сохраняем в кэш
+	cacheMutex.Lock()
+	resultCache[cleanURL] = res
+	cacheMutex.Unlock()
+
 	return res
 }
 
@@ -831,11 +875,13 @@ func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Некорректный JSON", http.StatusBadRequest)
 		return
 	}
+
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		http.Error(w, "В теле должен быть ровно один JSON-объект", http.StatusBadRequest)
 		return
 	}
+
 	targetURL := strings.TrimSpace(req.URL)
 	if targetURL == "" {
 		http.Error(w, "Поле url не может быть пустым", http.StatusBadRequest)
@@ -850,7 +896,6 @@ func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	result := analyzeURL(ctx, targetURL)
-
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(result); err != nil {
 		log.Printf("encode check: %v", err)
@@ -868,13 +913,12 @@ func apiDomainHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Некорректный домен", http.StatusBadRequest)
 		return
 	}
-	d = getRootDomain(d) // к реестру ходим только за корневой домен
+	d = getRootDomain(d)
 
 	ctx, cancel := context.WithTimeout(r.Context(), whoisBudget+time.Second)
 	defer cancel()
 
 	info := checkDomain(ctx, d)
-
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	if err := json.NewEncoder(w).Encode(info); err != nil {
 		log.Printf("encode domain: %v", err)
@@ -883,12 +927,13 @@ func apiDomainHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	initTrustedDomains()
+	initProtectedBrands()
 	initThreatIntel()
 	go initRDAPBootstrap()
 
 	tmpl := template.Must(template.ParseFiles(filepath.Join("templates", "index.html")))
-
 	mux := http.NewServeMux()
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -903,6 +948,7 @@ func main() {
 			log.Printf("template: %v", err)
 		}
 	})
+
 	mux.HandleFunc("/api/check", apiCheckHandler)
 	mux.HandleFunc("/api/domain", apiDomainHandler)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -914,11 +960,11 @@ func main() {
 	})
 
 	srv := &http.Server{
-		Addr:              ":8080", // только локально? поставьте "127.0.0.1:8080"
+		Addr:              ":8080",
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      20 * time.Second, // > бюджета /api/domain (9 с)
+		WriteTimeout:      20 * time.Second,
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
