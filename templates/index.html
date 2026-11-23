@@ -405,6 +405,11 @@
                 card.appendChild(pending);
             }
 
+            const pageDetails = buildPageDetails(data.page);
+            if (pageDetails) card.appendChild(pageDetails);
+            const coverageDetails = buildCoverageDetails(data.analysis_coverage);
+            if (coverageDetails) card.appendChild(coverageDetails);
+
             if (data.redirects && data.redirects.chain && data.redirects.chain.length > 1) {
                 const redirect = document.createElement('div');
                 redirect.style.marginTop = '8px';
@@ -446,10 +451,6 @@
                             const totalScore = Math.max(0, Math.min(100, baseScore + domainScore));
                             data.score = totalScore;
                             data.is_phish = Boolean(data.is_phish) || totalScore >= PHISH_THRESHOLD;
-                            data.reasons = [
-                                ...(Array.isArray(data.reasons) ? data.reasons : []),
-                                ...(Array.isArray(info.reasons) ? info.reasons : [])
-                            ];
                         } finally {
                             clearTimeout(timer);
                         }
@@ -468,6 +469,76 @@
 
             await Promise.all(Array.from({ length: Math.min(4, results.length) }, worker));
             if (run === runId) updateBatchSummary(results, batchView.summary, false);
+        }
+
+        function buildPageDetails(page) {
+            if (!page) return null;
+            const box = document.createElement('div');
+            box.className = 'page-analysis';
+            box.style.marginTop = '10px';
+            box.style.padding = '10px';
+            box.style.border = '1px solid var(--border-color, #444)';
+            box.style.borderRadius = '8px';
+
+            const heading = document.createElement('strong');
+            const statusLabels = {
+                ok: 'HTML-страница проанализирована',
+                unavailable: 'HTML-страница недоступна',
+                not_html: 'URL не ведёт на HTML-страницу',
+                http_error: 'Сайт вернул ошибку HTTP',
+                parse_error: 'Не удалось разобрать HTML',
+                skipped: 'Анализ HTML пропущен'
+            };
+            heading.textContent = 'Парсер страницы: ' + (statusLabels[page.status] || page.status || 'нет данных');
+            box.appendChild(heading);
+
+            if (page.status === 'ok') {
+                const details = document.createElement('div');
+                details.style.marginTop = '5px';
+                details.textContent = `Заголовок: ${page.title || 'не указан'} · Форм: ${page.forms || 0} · Полей пароля: ${page.password_fields || 0} · Внешних действий форм: ${page.external_form_actions || 0} · Ссылок: ${page.links || 0} (внешних: ${page.external_links || 0}) · iframe: ${page.iframes || 0} · Внешних скриптов: ${page.external_scripts || 0}`;
+                box.appendChild(details);
+                if (page.final_url) {
+                    const final = document.createElement('div');
+                    final.style.marginTop = '4px';
+                    final.textContent = 'Страница после редиректов: ' + page.final_url;
+                    box.appendChild(final);
+                }
+            }
+            return box;
+        }
+
+        function buildCoverageDetails(coverage) {
+            if (!coverage) return null;
+            const box = document.createElement('div');
+            box.className = 'coverage-analysis';
+            box.style.marginTop = '10px';
+            box.style.padding = '10px';
+            box.style.border = '1px solid var(--border-color, #444)';
+            box.style.borderRadius = '8px';
+
+            const labels = {
+                complete: 'полный',
+                partial: 'частичный',
+                limited: 'ограниченный'
+            };
+            const heading = document.createElement('strong');
+            const percent = Math.max(0, Math.min(100, Number(coverage.percent) || 0));
+            heading.textContent = `Полнота анализа: ${percent}% (${labels[coverage.status] || 'неизвестно'})`;
+            box.appendChild(heading);
+
+            if (Array.isArray(coverage.details) && coverage.details.length) {
+                const list = document.createElement('ul');
+                list.style.marginBottom = '0';
+                coverage.details.forEach(detail => list.appendChild(li(detail)));
+                box.appendChild(list);
+            }
+            const note = document.createElement('div');
+            note.style.marginTop = '5px';
+            note.style.fontSize = '12px';
+            note.style.color = 'var(--muted-color, #888)';
+            note.textContent = 'Полнота анализа не влияет на оценку риска.';
+            box.appendChild(note);
+            return box;
         }
 
         function renderError(message) {
@@ -493,6 +564,14 @@
             resultReasons.replaceChildren(...reasons.map(li));
 
             renderSSL(data);
+            const oldPageDetails = resultBox.querySelector('.page-analysis');
+            if (oldPageDetails) oldPageDetails.remove();
+            const pageDetails = buildPageDetails(data.page);
+            if (pageDetails) resultBox.appendChild(pageDetails);
+            const oldCoverage = resultBox.querySelector('.coverage-analysis');
+            if (oldCoverage) oldCoverage.remove();
+            const coverageDetails = buildCoverageDetails(data.analysis_coverage);
+            if (coverageDetails) resultBox.appendChild(coverageDetails);
             updateResultBoxStyle();
             resultBox.style.display = 'block';
         }

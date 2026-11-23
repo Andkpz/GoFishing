@@ -7,6 +7,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/net/html"
 	"html/template"
 	"io"
 	"log"
@@ -41,6 +42,28 @@ type RedirectReport struct {
 	Error        string   `json:"error,omitempty"`
 }
 
+type PageReport struct {
+	Status              string   `json:"status"`
+	FinalURL            string   `json:"final_url,omitempty"`
+	HTTPStatus          int      `json:"http_status,omitempty"`
+	Title               string   `json:"title,omitempty"`
+	Forms               int      `json:"forms"`
+	PasswordFields      int      `json:"password_fields"`
+	ExternalFormActions int      `json:"external_form_actions"`
+	ExternalLinks       int      `json:"external_links"`
+	Links               int      `json:"links"`
+	ExternalScripts     int      `json:"external_scripts"`
+	Iframes             int      `json:"iframes"`
+	Findings            []string `json:"findings,omitempty"`
+	Score               int      `json:"score"`
+}
+
+type AnalysisCoverage struct {
+	Percent int      `json:"percent"`
+	Status  string   `json:"status"`
+	Details []string `json:"details,omitempty"`
+}
+
 type CheckResult struct {
 	URL         string             `json:"url"`
 	IsPhish     bool               `json:"is_phish"`
@@ -52,6 +75,8 @@ type CheckResult struct {
 	WhoisStatus string             `json:"whois_status,omitempty"`
 	ThreatIntel *ThreatIntelReport `json:"threat_intel,omitempty"`
 	Redirects   *RedirectReport    `json:"redirects,omitempty"`
+	Page        *PageReport        `json:"page,omitempty"`
+	Coverage    *AnalysisCoverage  `json:"analysis_coverage,omitempty"`
 }
 
 var (
@@ -646,6 +671,237 @@ func inspectRedirects(ctx context.Context, startURL string) RedirectReport {
 	return report
 }
 
+const (
+	pageFetchTimeout = 1800 * time.Millisecond
+	pageMaxBytes     = 512 << 10
+	pageMaxScore     = 35
+)
+
+func fetchAndAnalyzePage(parent context.Context, target *url.URL, originalHost string) *PageReport {
+	report := &PageReport{Status: "skipped", Findings: []string{}}
+	if target == nil || (target.Scheme != "http" && target.Scheme != "https") {
+		return report
+	}
+	ctx, cancel := context.WithTimeout(parent, pageFetchTimeout)
+	defer cancel()
+
+	client := &http.Client{
+		Transport: redirectTransport,
+		Timeout:   pageFetchTimeout,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) > redirectMaxHops {
+				return fmt.Errorf("превышен лимит перенаправлений")
+			}
+			if (req.URL.Scheme != "http" && req.URL.Scheme != "https") || req.URL.User != nil {
+				return fmt.Errorf("небезопасный адрес перенаправления")
+			}
+			if _, err := normalizeHost(req.URL.Hostname()); err != nil {
+				return fmt.Errorf("некорректный хост перенаправления")
+			}
+			return nil
+		},
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		report.Status = "error"
+		return report
+	}
+	request.Header.Set("User-Agent", "PhishDetector/1.0 (+HTML analysis)")
+	request.Header.Set("Accept", "text/html,application/xhtml+xml;q=0.9,*/*;q=0.1")
+	request.Header.Set("Accept-Encoding", "identity")
+
+	response, err := client.Do(request)
+	if err != nil {
+		report.Status = "unavailable"
+		return report
+	}
+	defer response.Body.Close()
+	report.HTTPStatus = response.StatusCode
+	if response.Request != nil && response.Request.URL != nil {
+		report.FinalURL = response.Request.URL.String()
+	}
+	if response.StatusCode < 200 || response.StatusCode >= 400 {
+		report.Status = "http_error"
+		return report
+	}
+	contentType := strings.ToLower(response.Header.Get("Content-Type"))
+	if contentType != "" && !strings.Contains(contentType, "text/html") && !strings.Contains(contentType, "application/xhtml+xml") {
+		report.Status = "not_html"
+		return report
+	}
+	body := io.LimitReader(response.Body, pageMaxBytes+1)
+	doc, err := html.Parse(body)
+	if err != nil {
+		report.Status = "parse_error"
+		return report
+	}
+	report.Status = "ok"
+	pageURL := target
+	finalHost := originalHost
+	if response.Request != nil && response.Request.URL != nil {
+		pageURL = response.Request.URL
+		finalHost = strings.ToLower(response.Request.URL.Hostname())
+	}
+	finalRoot := getRootDomain(finalHost)
+
+	var walk func(*html.Node)
+	walk = func(node *html.Node) {
+		if node.Type == html.ElementNode {
+			attrs := make(map[string]string, len(node.Attr))
+			for _, attr := range node.Attr {
+				attrs[strings.ToLower(attr.Key)] = strings.TrimSpace(attr.Val)
+			}
+			switch strings.ToLower(node.Data) {
+			case "title":
+				if report.Title == "" {
+					report.Title = strings.TrimSpace(nodeText(node))
+				}
+			case "form":
+				report.Forms++
+				action := attrs["action"]
+				if action != "" {
+					if actionURL, parseErr := pageURL.Parse(action); parseErr == nil && actionURL.Hostname() != "" && !sameRegistrableDomain(finalRoot, getRootDomain(strings.ToLower(actionURL.Hostname()))) {
+						report.ExternalFormActions++
+					}
+				}
+			case "input":
+				if strings.EqualFold(attrs["type"], "password") || strings.Contains(strings.ToLower(attrs["autocomplete"]), "current-password") {
+					report.PasswordFields++
+				}
+			case "a":
+				if href := attrs["href"]; href != "" {
+					if link, parseErr := pageURL.Parse(href); parseErr == nil && (link.Scheme == "http" || link.Scheme == "https") && link.Hostname() != "" {
+						report.Links++
+						if !sameRegistrableDomain(finalRoot, getRootDomain(strings.ToLower(link.Hostname()))) {
+							report.ExternalLinks++
+						}
+					}
+				}
+			case "script":
+				if src := attrs["src"]; src != "" {
+					if scriptURL, parseErr := pageURL.Parse(src); parseErr == nil && scriptURL.Hostname() != "" && !sameRegistrableDomain(finalRoot, getRootDomain(strings.ToLower(scriptURL.Hostname()))) {
+						report.ExternalScripts++
+					}
+				}
+			case "iframe":
+				report.Iframes++
+			}
+		}
+		for child := node.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
+		}
+	}
+	walk(doc)
+
+	add := func(points int, finding string) {
+		report.Score += points
+		report.Findings = append(report.Findings, finding)
+	}
+	if report.PasswordFields > 0 {
+		add(5, fmt.Sprintf("На странице обнаружено полей ввода пароля: %d.", report.PasswordFields))
+	}
+	if report.ExternalFormActions > 0 {
+		add(25, fmt.Sprintf("Форма отправляет введённые данные на другой регистрируемый домен (%d форм).", report.ExternalFormActions))
+	}
+	if report.Iframes > 0 {
+		add(5, fmt.Sprintf("На странице обнаружено встроенных iframe: %d.", report.Iframes))
+	}
+	if report.Links >= 5 && report.ExternalLinks*100/report.Links >= 80 {
+		add(5, "Большинство ссылок на странице ведёт на внешние домены.")
+	}
+	if report.ExternalScripts >= 3 {
+		add(3, fmt.Sprintf("Загружается много внешних JavaScript-файлов: %d.", report.ExternalScripts))
+	}
+	if report.Score > pageMaxScore {
+		report.Score = pageMaxScore
+	}
+	return report
+}
+
+func nodeText(node *html.Node) string {
+	var b strings.Builder
+	var walk func(*html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.TextNode {
+			b.WriteString(n.Data)
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			walk(c)
+		}
+	}
+	walk(node)
+	return b.String()
+}
+
+func sameRegistrableDomain(a, b string) bool {
+	if a == "" || b == "" {
+		return strings.EqualFold(a, b)
+	}
+	return strings.EqualFold(a, b)
+}
+
+// buildAnalysisCoverage оценивает полноту выполненных проверок, не меняя Risk Score.
+func buildAnalysisCoverage(res *CheckResult, sslApplicable bool) *AnalysisCoverage {
+	coverage := &AnalysisCoverage{Details: []string{}}
+	totalWeight := 25.0 // анализ структуры URL всегда выполняется
+	completedWeight := 25.0
+	coverage.Details = append(coverage.Details, "Структура URL: проверена")
+
+	// Threat Intelligence: clean/hit — полноценный ответ, partial — частичный.
+	totalWeight += 25
+	if res.ThreatIntel != nil {
+		switch res.ThreatIntel.Status {
+		case "clean", "hit":
+			completedWeight += 25
+			coverage.Details = append(coverage.Details, "Базы фишинговых ссылок: проверены")
+		case "partial":
+			completedWeight += 12.5
+			coverage.Details = append(coverage.Details, "Базы фишинговых ссылок: проверены частично")
+		default:
+			coverage.Details = append(coverage.Details, "Базы фишинговых ссылок: недоступны")
+		}
+	} else {
+		coverage.Details = append(coverage.Details, "Базы фишинговых ссылок: не проверены")
+	}
+
+	totalWeight += 20
+	if res.Redirects != nil && res.Redirects.Checked {
+		completedWeight += 20
+		coverage.Details = append(coverage.Details, "Цепочка перенаправлений: проверена")
+	} else {
+		coverage.Details = append(coverage.Details, "Цепочка перенаправлений: не проверена")
+	}
+
+	totalWeight += 20
+	if res.Page != nil && res.Page.Status == "ok" {
+		completedWeight += 20
+		coverage.Details = append(coverage.Details, "HTML-содержимое: проанализировано")
+	} else {
+		coverage.Details = append(coverage.Details, "HTML-содержимое: не удалось проанализировать")
+	}
+
+	if sslApplicable {
+		totalWeight += 10
+		if res.SSL != nil {
+			completedWeight += 10
+			coverage.Details = append(coverage.Details, "SSL/TLS: проверен")
+		} else {
+			coverage.Details = append(coverage.Details, "SSL/TLS: проверка не завершена")
+		}
+	}
+
+	coverage.Percent = int(math.Round(completedWeight / totalWeight * 100))
+	switch {
+	case coverage.Percent >= 90:
+		coverage.Status = "complete"
+	case coverage.Percent >= 60:
+		coverage.Status = "partial"
+	default:
+		coverage.Status = "limited"
+	}
+	return coverage
+}
+
 func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 	cleanURL := strings.TrimSpace(rawURL)
 
@@ -715,6 +971,7 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.IsPhish = false
 		res.Score = 0
 		res.Reasons = append(res.Reasons, fmt.Sprintf("Домен '%s' присутствует в рейтинге популярных сайтов и автоматически считается безопасным.", rootDomain))
+		res.Coverage = &AnalysisCoverage{Percent: 25, Status: "limited", Details: []string{"Структура URL: проверена", "Остальные проверки пропущены из-за доверенного домена"}}
 
 		// Сохраняем в кэш
 		cacheMutex.Lock()
@@ -730,6 +987,7 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Score = 100
 		res.IsPhish = true
 		res.Reasons = append(res.Reasons, intel.Reasons...)
+		res.Coverage = &AnalysisCoverage{Percent: 50, Status: "limited", Details: []string{"Структура URL: проверена", "Базы фишинговых ссылок: совпадение найдено", "Дополнительные проверки остановлены после подтверждения угрозы"}}
 		return res
 	}
 	if len(intel.Reasons) > 0 {
@@ -841,6 +1099,13 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 		res.Reasons = append(res.Reasons, "Не удалось полностью проверить цепочку редиректов: "+redirectReport.Error)
 	}
 
+	pageReport := fetchAndAnalyzePage(ctx, parsed, host)
+	res.Page = pageReport
+	if pageReport != nil && pageReport.Status == "ok" {
+		res.Score += pageReport.Score
+		res.Reasons = append(res.Reasons, pageReport.Findings...)
+	}
+
 	if !isIP && !urlShorteners[rootDomain] && res.Score < phishingThreshold {
 		rep := checkSSL(ctx, host)
 		res.SSL = &rep
@@ -853,6 +1118,12 @@ func analyzeURL(ctx context.Context, rawURL string) CheckResult {
 	if res.Score > 100 {
 		res.Score = 100
 	}
+	sslApplicable := !isIP && !urlShorteners[rootDomain] && res.Score < phishingThreshold
+	// Если SSL уже проверен, он учитывается независимо от итогового балла.
+	if res.SSL != nil {
+		sslApplicable = true
+	}
+	res.Coverage = buildAnalysisCoverage(&res, sslApplicable)
 
 	// Сохраняем в кэш
 	cacheMutex.Lock()
@@ -892,7 +1163,7 @@ func apiCheckHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
 	result := analyzeURL(ctx, targetURL)
