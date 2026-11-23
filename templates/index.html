@@ -16,16 +16,29 @@
         }
         .container { width: 100%; max-width: 600px; padding: 0 20px; }
         h1 { font-size: 24px; color: #212529; margin-bottom: 20px; }
-        .search-box { display: flex; gap: 10px; }
-        input[type="text"] {
-            flex: 1;
+        .search-box { display: flex; flex-direction: column; gap: 10px; }
+        #urlInput {
+            box-sizing: border-box;
+            width: 100%;
+            min-height: 110px;
             padding: 12px 15px;
-            font-size: 16px;
+            font: inherit;
+            font-size: 15px;
+            line-height: 1.5;
             border: 1px solid #ced4da;
             border-radius: 6px;
             outline: none;
+            resize: vertical;
         }
-        input[type="text"]:focus { border-color: #0d6efd; }
+        #urlInput:focus { border-color: #0d6efd; }
+        .batch-results { display: grid; gap: 12px; margin-top: 20px; }
+        .batch-card { padding: 16px; border-radius: 8px; border: 1px solid; overflow-wrap: anywhere; }
+        .batch-card.safe { background: #d1e7dd; color: #0f5132; border-color: #badbcc; }
+        .batch-card.warn { background: #fff3cd; color: #664d03; border-color: #ffecb5; }
+        .batch-card.danger { background: #f8d7da; color: #842029; border-color: #f5c2c7; }
+        .batch-url { font-weight: 600; margin-bottom: 8px; }
+        .batch-score { font-weight: 700; margin-bottom: 8px; }
+        .batch-card ul { margin-top: 8px; }
         button {
             padding: 12px 24px;
             font-size: 16px;
@@ -112,13 +125,15 @@
     <div class="container">
         <h1>Детектор фишинговых ссылок</h1>
         <div class="search-box">
-            <input type="text" id="urlInput" placeholder="Введите ссылку (например, https://example.com)"
-                   autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
-                   aria-label="Ссылка для проверки">
-            <button id="checkBtn" onclick="checkURL()">Проверить</button>
+            <textarea id="urlInput" placeholder="Вставьте одну или несколько ссылок — каждую с новой строки"
+                      autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
+                      aria-label="Ссылки для проверки"></textarea>
+            <button id="checkBtn" onclick="checkURL()">Проверить ссылки</button>
+            <div style="font-size:13px;color:#6c757d">Поддерживается до 100 ссылок за один запуск. Пустые строки игнорируются.</div>
         </div>
 
-        <div id="loader" class="loader">Проверка ссылки и SSL-сертификата...</div>
+        <div id="loader" class="loader">Проверка ссылок...</div>
+        <div id="batchResults" class="batch-results" aria-live="polite"></div>
 
         <div id="resultBox" class="result-box" aria-live="polite">
             <div class="result-title" id="resultTitle"></div>
@@ -143,6 +158,7 @@
         const sslBox         = document.getElementById('sslBox');
         const whoisBox       = document.getElementById('whoisBox');
         const incompleteNote = document.getElementById('incompleteNote');
+        const batchResults = document.getElementById('batchResults');
 
         const REQUEST_TIMEOUT_MS = 6000;   // /api/check укладывается в ~2 с
         const DOMAIN_TIMEOUT_MS  = 15000;  // /api/domain: RDAP + WHOIS до 9 с
@@ -195,7 +211,7 @@
 
         urlInput.addEventListener('input', hideResult);
         urlInput.addEventListener('keydown', function (e) {
-            if (e.key === 'Enter') {
+            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
                 e.preventDefault();
                 checkURL();
             }
@@ -209,6 +225,7 @@
             currentUrl = '';
 
             resultBox.style.display = 'none';
+            batchResults.replaceChildren();
             resultReasons.replaceChildren();
             sslBox.replaceChildren();
             sslBox.style.display = 'none';
@@ -220,46 +237,237 @@
             if (domainCtrl) { domainCtrl.abort(); domainCtrl = null; }
         }
         async function checkURL() {
-            const url = urlInput.value.trim();
-            if (!url || checkBtn.disabled) return;
-            const run = ++runId;
+            const urls = [...new Set(urlInput.value.split(/\r?\n/).map(value => value.trim()).filter(Boolean))];
+            if (!urls.length || checkBtn.disabled) return;
+            if (urls.length > 100) {
+                renderError('За один запуск можно проверить не более 100 ссылок.');
+                return;
+            }
 
+            const run = ++runId;
             checkBtn.disabled = true;
             hideResult();
+            loader.textContent = `Проверка ссылок: 0 из ${urls.length}...`;
             loader.style.display = 'block';
 
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
-
             try {
-                const response = await fetch('/api/check', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ url: url }),
-                    signal: ctrl.signal
-                });
+                // Ограничиваем параллелизм, чтобы не перегружать локальный сервер.
+                const results = new Array(urls.length);
+                let nextIndex = 0;
+                let completed = 0;
+                const worker = async () => {
+                    while (true) {
+                        const index = nextIndex++;
+                        if (index >= urls.length) return;
+                        try {
+                            const ctrl = new AbortController();
+                            const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+                            try {
+                                const response = await fetch('/api/check', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ url: urls[index] }),
+                                    signal: ctrl.signal
+                                });
+                                if (!response.ok) {
+                                    const message = (await response.text()).trim();
+                                    throw new Error(message || `Ошибка сервера: ${response.status}`);
+                                }
+                                results[index] = await response.json();
+                            } finally {
+                                clearTimeout(timer);
+                            }
+                        } catch (error) {
+                            results[index] = { url: urls[index], error: error.name === 'AbortError'
+                                ? 'Превышено время ожидания проверки.' : error.message };
+                        }
+                        completed++;
+                        if (run === runId) loader.textContent = `Проверка ссылок: ${completed} из ${urls.length}...`;
+                    }
+                };
 
-                if (!response.ok) {
-                    const text = (await response.text()).trim();
-                    throw new Error(text || ('Ошибка сервера: ' + response.status));
+                await Promise.all(Array.from({ length: Math.min(4, urls.length) }, worker));
+                if (run !== runId) return;
+
+                if (results.length === 1 && !results[0].error) {
+                    renderResult(results[0]);
+                    maybeFetchDomain(results[0], run);
+                } else {
+                    const batchView = renderBatchResults(results);
+                    await enrichBatchResults(results, batchView, run);
                 }
-
-                const data = await response.json();
-                if (run !== runId) return;
-                renderResult(data);
-                maybeFetchDomain(data, run);
-            } catch (err) {
-                if (run !== runId) return;
-                renderError(err.name === 'AbortError'
-                    ? 'Сервер не ответил за 6 секунд. Проверьте, что процесс запущен.'
-                    : err.message);
+            } catch (error) {
+                if (run === runId) renderError(error.message);
             } finally {
-                clearTimeout(timer);
                 if (run === runId) {
                     checkBtn.disabled = false;
                     loader.style.display = 'none';
                 }
             }
+        }
+
+        function renderBatchResults(results) {
+            const summary = document.createElement('div');
+            summary.className = 'batch-summary';
+            batchResults.appendChild(summary);
+
+            const cards = results.map(data => {
+                const card = document.createElement('section');
+                card.className = 'batch-card';
+                batchResults.appendChild(card);
+                renderBatchCard(card, data);
+                return card;
+            });
+
+            updateBatchSummary(results, summary, true);
+            return { cards, summary };
+        }
+
+        function updateBatchSummary(results, summary, checkingWhois = false) {
+            const failed = results.filter(item => !item || item.error).length;
+            const checked = results.length - failed;
+            const phishing = results.filter(item => item && !item.error && item.is_phish).length;
+            const incomplete = results.filter(item => {
+                if (!item || item.error || item.whois_status !== 'pending') return false;
+                const status = item.domainInfo && item.domainInfo.status;
+                return !status || ['unknown', 'limited', 'skipped'].includes(status) || Boolean(item.domain_check_error);
+            }).length;
+            summary.textContent = `Проверено: ${checked} из ${results.length} · Высокий риск: ${phishing} · Ошибок: ${failed}` +
+                (checkingWhois ? ' · Уточнение возраста доменов...' : (incomplete ? ` · WHOIS не завершён: ${incomplete}` : ''));
+        }
+
+        function renderBatchCard(card, data) {
+            card.replaceChildren();
+            const url = document.createElement('div');
+            url.className = 'batch-url';
+            url.textContent = data.url || 'Неизвестная ссылка';
+            card.appendChild(url);
+
+            if (data.error) {
+                card.className = 'batch-card danger';
+                const error = document.createElement('div');
+                error.textContent = 'Ошибка проверки: ' + data.error;
+                card.appendChild(error);
+                return;
+            }
+
+            const score = Math.max(0, Math.min(100, Number(data.score) || 0));
+            card.className = 'batch-card ' + (data.is_phish ? 'danger' : (score > 0 ? 'warn' : 'safe'));
+            const status = document.createElement('div');
+            status.className = 'batch-score';
+            status.textContent = `${data.is_phish ? '⚠️ Возможный фишинг' : 'Риск не превышает порог'} · ${score}/100`;
+            card.appendChild(status);
+
+            if (data.domain) {
+                const domain = document.createElement('div');
+                domain.textContent = 'Домен: ' + data.domain;
+                card.appendChild(domain);
+            }
+
+            const reasons = [...(Array.isArray(data.reasons) ? data.reasons : [])];
+            const domainInfo = data.domainInfo;
+            if (domainInfo && Array.isArray(domainInfo.reasons)) reasons.push(...domainInfo.reasons);
+            const items = reasons.length ? reasons : ['Подозрительных признаков не обнаружено.'];
+            const list = document.createElement('ul');
+            items.forEach(reason => list.appendChild(li(reason)));
+            card.appendChild(list);
+
+            if (domainInfo) {
+                const whois = document.createElement('div');
+                whois.style.marginTop = '8px';
+                if (domainInfo.created) {
+                    whois.textContent = `WHOIS/RDAP: зарегистрирован ${fmtDate(domainInfo.created)} · возраст ${formatAge(Number(domainInfo.age_days) || 0)}`;
+                } else {
+                    const labels = {
+                        unknown: 'WHOIS/RDAP: не удалось определить возраст домена',
+                        limited: 'WHOIS/RDAP: реестр ограничил запросы',
+                        skipped: 'WHOIS/RDAP: проверка пропущена',
+                        not_found: 'WHOIS/RDAP: домен не найден'
+                    };
+                    whois.textContent = labels[domainInfo.status] || 'WHOIS/RDAP: ' + (domainInfo.status || 'нет данных');
+                }
+                card.appendChild(whois);
+                if (Array.isArray(domainInfo.notes) && domainInfo.notes.length) {
+                    const notes = document.createElement('ul');
+                    notes.className = 'ssl-notes';
+                    domainInfo.notes.forEach(note => notes.appendChild(li(note)));
+                    card.appendChild(notes);
+                }
+            } else if (data.domain_check_error) {
+                const warning = document.createElement('div');
+                warning.style.marginTop = '8px';
+                warning.textContent = 'WHOIS/RDAP: дополнительная проверка не завершена — ' + data.domain_check_error;
+                card.appendChild(warning);
+            } else if (data.whois_status === 'pending') {
+                const pending = document.createElement('div');
+                pending.style.marginTop = '8px';
+                pending.textContent = '⏳ Уточняется возраст домена...';
+                card.appendChild(pending);
+            }
+
+            if (data.redirects && data.redirects.chain && data.redirects.chain.length > 1) {
+                const redirect = document.createElement('div');
+                redirect.style.marginTop = '8px';
+                redirect.textContent = 'Конечный адрес после перенаправлений: ' +
+                    (data.redirects.final_url || data.redirects.chain[data.redirects.chain.length - 1]);
+                card.appendChild(redirect);
+            }
+            if (data.ssl_status) {
+                const ssl = document.createElement('div');
+                ssl.style.marginTop = '6px';
+                ssl.textContent = 'SSL/TLS: ' + data.ssl_status;
+                card.appendChild(ssl);
+            }
+        }
+
+        async function enrichBatchResults(results, batchView, run) {
+            let nextIndex = 0;
+            const worker = async () => {
+                while (true) {
+                    const index = nextIndex++;
+                    if (index >= results.length) return;
+                    const data = results[index];
+                    if (!data || data.error || !data.domain || data.whois_status !== 'pending') continue;
+
+                    try {
+                        const ctrl = new AbortController();
+                        const timer = setTimeout(() => ctrl.abort(), DOMAIN_TIMEOUT_MS);
+                        try {
+                            const response = await fetch('/api/domain?domain=' + encodeURIComponent(data.domain), {
+                                signal: ctrl.signal
+                            });
+                            if (!response.ok) throw new Error('HTTP ' + response.status);
+                            const info = await response.json();
+                            if (run !== runId) return;
+
+                            data.domainInfo = info;
+                            const baseScore = Number(data.score) || 0;
+                            const domainScore = Number(info.score) || 0;
+                            const totalScore = Math.max(0, Math.min(100, baseScore + domainScore));
+                            data.score = totalScore;
+                            data.is_phish = Boolean(data.is_phish) || totalScore >= PHISH_THRESHOLD;
+                            data.reasons = [
+                                ...(Array.isArray(data.reasons) ? data.reasons : []),
+                                ...(Array.isArray(info.reasons) ? info.reasons : [])
+                            ];
+                        } finally {
+                            clearTimeout(timer);
+                        }
+                    } catch (error) {
+                        if (run !== runId) return;
+                        data.domain_check_error = error.name === 'AbortError'
+                            ? 'превышено время ожидания' : error.message;
+                    }
+
+                    if (run === runId) {
+                        renderBatchCard(batchView.cards[index], data);
+                        updateBatchSummary(results, batchView.summary, true);
+                    }
+                }
+            };
+
+            await Promise.all(Array.from({ length: Math.min(4, results.length) }, worker));
+            if (run === runId) updateBatchSummary(results, batchView.summary, false);
         }
 
         function renderError(message) {
