@@ -6,130 +6,149 @@
     <title>Проверка ссылки на фишинг</title>
     <link rel="icon" href="data:,">
     <style>
+        :root {
+            color-scheme: dark;
+            --bg: #101216;
+            --surface: #181b21;
+            --surface-soft: #20242c;
+            --line: #2b303a;
+            --text: #e8ebf0;
+            --muted: #929baa;
+            --accent: #7895ff;
+            --green: #45bd8b;
+            --yellow: #e5b454;
+            --red: #ef7180;
+            --safe-bg: #142a22; --safe-border: #286348;
+            --warn-bg: #302817; --warn-border: #70551f;
+            --danger-bg: #321d23; --danger-border: #713541;
+        }
+        :root[data-theme="light"] {
+            color-scheme: light;
+            --bg: #f6f7f9; --surface: #fff; --surface-soft: #fafbfc;
+            --line: #e6e8ec; --text: #20242c; --muted: #737b88;
+            --accent: #315efb; --green: #16845b; --yellow: #a66b08; --red: #c43d4f;
+            --safe-bg: #eaf7f0; --safe-border: #b9e3cc;
+            --warn-bg: #fff6df; --warn-border: #efd48a;
+            --danger-bg: #fdecef; --danger-border: #efbdc5;
+        }
+        * { box-sizing: border-box; }
         body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-            background-color: #f8f9fa;
-            display: flex;
-            justify-content: center;
-            padding-top: 80px;
-            margin: 0;
+            min-height: 100vh; margin: 0; padding: 72px 20px 88px;
+            color: var(--text); background: var(--bg);
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            -webkit-font-smoothing: antialiased;
         }
-        .container { width: 100%; max-width: 600px; padding: 0 20px; }
-        h1 { font-size: 24px; color: #212529; margin-bottom: 20px; }
-        .search-box { display: flex; flex-direction: column; gap: 10px; }
+        .container { width: 100%; max-width: 760px; margin: 0 auto; }
+        .eyebrow {
+            display: flex; align-items: center; gap: 8px; margin-bottom: 18px;
+            color: var(--muted); font-size: 11px; font-weight: 700;
+            letter-spacing: .12em; text-transform: uppercase;
+        }
+        .eyebrow:before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--accent); }
+        h1 { margin: 0; color: #171a20; font-size: clamp(30px, 5vw, 42px); line-height: 1.12; letter-spacing: -.045em; font-weight: 720; }
+        .subtitle { max-width: 590px; margin: 14px 0 30px; color: var(--muted); font-size: 15px; line-height: 1.65; }
+        .search-box, .result-box, .batch-summary, .batch-card, .page-analysis, .coverage-analysis {
+            background: var(--surface); border: 1px solid var(--line); border-radius: 12px;
+            box-shadow: 0 2px 8px rgba(20, 28, 45, .025);
+        }
+        .search-box { display: flex; flex-direction: column; gap: 12px; padding: 16px; }
         #urlInput {
-            box-sizing: border-box;
-            width: 100%;
-            min-height: 110px;
-            padding: 12px 15px;
-            font: inherit;
-            font-size: 15px;
-            line-height: 1.5;
-            border: 1px solid #ced4da;
-            border-radius: 6px;
-            outline: none;
-            resize: vertical;
+            width: 100%; min-height: 116px; padding: 14px 15px; resize: vertical;
+            border: 1px solid var(--line); border-radius: 8px; outline: none;
+            background: var(--surface-soft); color: var(--text); font: inherit;
+            font-size: 14px; line-height: 1.6; transition: border-color .15s, box-shadow .15s;
         }
-        #urlInput:focus { border-color: #0d6efd; }
-        .batch-results { display: grid; gap: 12px; margin-top: 20px; }
-        .batch-card { padding: 16px; border-radius: 8px; border: 1px solid; overflow-wrap: anywhere; }
-        .batch-card.safe { background: #d1e7dd; color: #0f5132; border-color: #badbcc; }
-        .batch-card.warn { background: #fff3cd; color: #664d03; border-color: #ffecb5; }
-        .batch-card.danger { background: #f8d7da; color: #842029; border-color: #f5c2c7; }
-        .batch-url { font-weight: 600; margin-bottom: 8px; }
-        .batch-score { font-weight: 700; margin-bottom: 8px; }
-        .batch-card ul { margin-top: 8px; }
+        #urlInput::placeholder { color: #9aa1ac; }
+        #urlInput:focus { border-color: #9aafff; box-shadow: 0 0 0 3px rgba(49,94,251,.08); }
         button {
-            padding: 12px 24px;
-            font-size: 16px;
-            background-color: #0d6efd;
-            color: white;
-            border: none;
-            border-radius: 6px;
-            cursor: pointer;
-            transition: background-color 0.2s;
+            min-height: 44px; padding: 11px 18px; border: 0; border-radius: 8px;
+            color: #fff; background: var(--accent); font: inherit; font-size: 14px;
+            font-weight: 650; cursor: pointer; transition: background .15s, transform .15s;
         }
-        button:hover { background-color: #0b5ed7; }
-        button:disabled { background-color: #6c757d; cursor: not-allowed; }
-        .loader { display: none; margin-top: 20px; color: #495057; font-size: 15px; }
-        .result-box {
-            display: none;
-            margin-top: 20px;
-            padding: 20px;
-            border-radius: 8px;
-            transition: background-color 0.25s ease, border-color 0.25s ease;
+        button:hover { background: #244fe5; }
+        button:active { transform: translateY(1px); }
+        button:disabled { opacity: .55; cursor: wait; }
+        .search-box > div { color: var(--muted) !important; font-size: 12px !important; }
+        .loader { display: none; margin-top: 14px; padding: 13px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); color: var(--muted); font-size: 13px; }
+        .loader:before { content: '◌'; display: inline-block; margin-right: 9px; color: var(--accent); animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .batch-results { display: grid; gap: 10px; margin-top: 16px; }
+        .batch-summary { padding: 13px 15px; color: var(--muted); font-size: 13px; }
+        .batch-card { padding: 16px; overflow-wrap: anywhere; color: var(--text); }
+        .batch-card.safe, .result-box.safe { border-color: var(--safe-border); background: var(--safe-bg); }
+        .batch-card.warn, .result-box.warn { border-color: var(--warn-border); background: var(--warn-bg); }
+        .batch-card.danger, .result-box.danger { border-color: var(--danger-border); background: var(--danger-bg); }
+        .batch-url { margin-bottom: 8px; color: var(--text); font-weight: 650; line-height: 1.5; }
+        .batch-score { margin-bottom: 8px; font-weight: 700; }
+        .batch-card ul { margin-top: 9px; }
+        .batch-card li, li { margin-bottom: 6px; color: #555e6b; line-height: 1.55; }
+        .result-box { display: none; margin-top: 16px; padding: 20px; color: var(--text); }
+        .result-title { margin-bottom: 12px; color: var(--text); font-size: 16px; font-weight: 700; line-height: 1.5; overflow-wrap: anywhere; }
+        .score { margin-bottom: 10px; color: #424a56; font-weight: 650; font-size: 14px; }
+        .score-bar { height: 6px; margin-bottom: 16px; overflow: hidden; border-radius: 99px; background: #edf0f3; }
+        .score-fill { height: 100%; width: 0; border-radius: inherit; transition: width .35s ease; }
+        .safe .score-fill { background: var(--green); } .warn .score-fill { background: #d49a2a; } .danger .score-fill { background: var(--red); }
+        ul { margin: 0; padding-left: 19px; }
+        .ssl-box { display: none; margin-top: 12px; padding: 14px 15px; border: 1px solid var(--line); border-left: 3px solid #aab1bb; border-radius: 8px; background: var(--surface-soft); color: var(--text); font-size: 13px; }
+        .ssl-ok { border-left-color: var(--green); } .ssl-warn { border-left-color: #d49a2a; } .ssl-bad { border-left-color: var(--red); } .ssl-muted { border-left-color: #929aa6; }
+        .ssl-head { display: flex; align-items: center; gap: 9px; font-weight: 650; }
+        .ssl-time { margin-left: auto; color: var(--muted); font-size: 11px; font-weight: 450; white-space: nowrap; }
+        .ssl-meta { margin-top: 7px; color: #626b78; line-height: 1.6; overflow-wrap: anywhere; }
+        .ssl-notes { margin: 8px 0 0; padding-left: 18px; color: var(--muted); }
+        .ssl-box details { margin-top: 9px; } .ssl-box summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+        .ssl-box code { display: block; margin-top: 8px; padding: 9px; border-radius: 6px; background: #f0f2f5; color: #414957; font-size: 11px; white-space: pre-wrap; word-break: break-all; }
+        .incomplete { display: none; margin-top: 12px; padding: 11px 13px; border: 1px solid #f0e4c9; border-radius: 8px; background: #fffbf2; color: #805b18; font-size: 12px; line-height: 1.55; }
+        .page-analysis, .coverage-analysis { margin-top: 12px; padding: 15px; color: var(--text); }
+        .page-analysis h3, .coverage-analysis h3 { margin: 0 0 10px; color: var(--text); font-size: 14px; }
+        .page-analysis p, .coverage-analysis p { color: #626b78; font-size: 13px; line-height: 1.55; }
+        .page-analysis ul, .coverage-analysis ul { margin-top: 8px; }
+        @media (max-width: 600px) {
+            body { padding: 42px 14px 56px; }
+            .search-box { padding: 12px; }
+            .result-box { padding: 16px; }
+            .ssl-time { font-size: 10px; }
         }
-        .safe { background-color: #d1e7dd; color: #0f5132; border: 1px solid #badbcc; }
-        .warn { background-color: #fff3cd; color: #664d03; border: 1px solid #ffecb5; }
-        .danger { background-color: #f8d7da; color: #842029; border: 1px solid #f5c2c7; }
-        .result-title { font-weight: bold; font-size: 18px; margin-bottom: 10px; word-break: break-all; }
-        .score { font-weight: bold; margin-bottom: 8px; }
-        .score-bar {
-            height: 6px;
-            background: rgba(0, 0, 0, .12);
-            border-radius: 3px;
-            overflow: hidden;
-            margin-bottom: 12px;
-        }
-        .score-fill { height: 100%; width: 0; transition: width .3s ease; }
-        .safe .score-fill { background-color: #198754; }
-        .warn .score-fill { background-color: #ffc107; }
-        .danger .score-fill { background-color: #dc3545; }
-        ul { margin: 0; padding-left: 20px; }
-        li { margin-bottom: 5px; }
-
-        .ssl-box {
-            display: none;
-            margin-top: 14px;
-            padding: 12px 14px;
-            background: #ffffff;
-            border: 1px solid #dee2e6;
-            border-radius: 6px;
-            color: #343a40;
-            font-size: 14px;
-        }
-        .ssl-ok    { border-left: 4px solid #198754; }
-        .ssl-warn  { border-left: 4px solid #ffc107; }
-        .ssl-bad   { border-left: 4px solid #dc3545; }
-        .ssl-muted { border-left: 4px solid #adb5bd; }
-        .ssl-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
-        .ssl-time { margin-left: auto; font-weight: 400; font-size: 12px; color: #6c757d; white-space: nowrap; }
-        .ssl-meta { margin-top: 6px; color: #495057; line-height: 1.5; word-break: break-word; }
-        .ssl-notes { margin: 8px 0 0; padding-left: 18px; color: #6c757d; }
-        .ssl-box details { margin-top: 8px; }
-        .ssl-box summary { cursor: pointer; font-size: 13px; color: #6c757d; }
-        .ssl-box code {
-            display: block;
-            margin-top: 6px;
-            padding: 8px;
-            background: #f1f3f5;
-            border-radius: 4px;
-            font-size: 12px;
-            white-space: pre-wrap;
-            word-break: break-all;
-        }
-        .incomplete {
-            display: none;
-            margin-top: 12px;
-            padding: 8px 10px;
-            background: rgba(255, 255, 255, 0.65);
-            border: 1px solid #ffecb5;
-            border-radius: 6px;
-            color: #664d03;
-            font-size: 13px;
-            line-height: 1.45;
-        }
+        .topline { display:flex; justify-content:flex-end; margin-bottom:24px; }
+        .theme-toggle { min-height:36px; padding:7px 11px; border:1px solid var(--line); color:var(--text); background:var(--surface); font-size:12px; font-weight:600; }
+        .theme-toggle:hover { background:var(--surface-soft); }
+        .upload-row { display:flex; align-items:center; flex-wrap:wrap; gap:10px; }
+        .upload-label { display:inline-flex; align-items:center; justify-content:center; min-height:40px; padding:9px 13px; border:1px solid var(--line); border-radius:8px; color:var(--text); background:var(--surface-soft); font-size:13px; font-weight:600; cursor:pointer; }
+        .upload-label:hover { border-color:var(--accent); }
+        #csvInput { position:absolute; width:1px; height:1px; opacity:0; pointer-events:none; }
+        #fileInfo { color:var(--muted); font-size:12px; }
+        :root:not([data-theme="light"]) h1 { color:var(--text); }
+        :root:not([data-theme="light"]) .batch-card li, :root:not([data-theme="light"]) li,
+        :root:not([data-theme="light"]) .ssl-meta, :root:not([data-theme="light"]) .page-analysis p,
+        :root:not([data-theme="light"]) .coverage-analysis p { color:#b3bbc7; }
+        :root:not([data-theme="light"]) .score { color:#c5cbd5; }
+        :root:not([data-theme="light"]) .score-bar { background:#303641; }
+        :root:not([data-theme="light"]) .ssl-box { background:var(--surface-soft); }
+        :root:not([data-theme="light"]) .ssl-box code { background:#11151b; color:#d1d7e0; }
+        :root:not([data-theme="light"]) .incomplete { background:#302817; border-color:#594724; color:#f0ca79; }
+        :root:not([data-theme="light"]) .page-analysis, :root:not([data-theme="light"]) .coverage-analysis { background:var(--surface-soft); }
+        :root:not([data-theme="light"]) .search-box > div { color:var(--muted) !important; }
+        :root[data-theme="light"] .theme-toggle { color:var(--text); }
+        @media (max-width: 600px) { .topline { margin-bottom:18px; } }
+        @media (prefers-reduced-motion: reduce) { *, *:before, *:after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Детектор фишинговых ссылок</h1>
+        <div class="topline"><button type="button" class="theme-toggle" id="themeToggle" aria-label="Переключить тему">☀ Светлая тема</button></div>
+        <div class="eyebrow">PHISHDETECTOR · SECURITY SCANNER</div>
+        <h1>Проверка ссылок<br>на фишинг</h1>
+        <p class="subtitle">Многоуровневый анализ URL, репутации домена, перенаправлений, SSL/TLS и содержимого страницы.</p>
         <div class="search-box">
             <textarea id="urlInput" placeholder="Вставьте одну или несколько ссылок — каждую с новой строки"
                       autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"
                       aria-label="Ссылки для проверки"></textarea>
-            <button id="checkBtn" onclick="checkURL()">Проверить ссылки</button>
-            <div style="font-size:13px;color:#6c757d">Поддерживается до 100 ссылок за один запуск. Пустые строки игнорируются.</div>
+            <div class="upload-row">
+                <button id="checkBtn" onclick="checkURL()">Проверить ссылки</button>
+                <label class="upload-label" for="csvInput">＋ Загрузить CSV</label>
+                <input id="csvInput" type="file" accept=".csv,text/csv">
+                <span id="fileInfo" aria-live="polite">Файл CSV: одна ссылка в строке или столбец URL</span>
+            </div>
+            <div style="font-size:13px;color:#929baa">До 100 ссылок за запуск. Можно вставить список вручную или загрузить CSV.</div>
         </div>
 
         <div id="loader" class="loader">Проверка ссылок...</div>
@@ -159,6 +178,83 @@
         const whoisBox       = document.getElementById('whoisBox');
         const incompleteNote = document.getElementById('incompleteNote');
         const batchResults = document.getElementById('batchResults');
+        const csvInput = document.getElementById('csvInput');
+        const fileInfo = document.getElementById('fileInfo');
+        const themeToggle = document.getElementById('themeToggle');
+
+        // Тема сохраняется между посещениями.
+        const savedTheme = localStorage.getItem('phishdetector-theme');
+        if (savedTheme === 'light') document.documentElement.dataset.theme = 'light';
+        updateThemeButton();
+        themeToggle.addEventListener('click', () => {
+            const next = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+            if (next === 'light') document.documentElement.dataset.theme = 'light';
+            else delete document.documentElement.dataset.theme;
+            localStorage.setItem('phishdetector-theme', next);
+            updateThemeButton();
+        });
+        function updateThemeButton() {
+            themeToggle.textContent = document.documentElement.dataset.theme === 'light' ? '☾ Тёмная тема' : '☀ Светлая тема';
+        }
+
+        csvInput.addEventListener('change', async () => {
+            const file = csvInput.files && csvInput.files[0];
+            if (!file) return;
+            if (!/\.csv$/i.test(file.name)) {
+                fileInfo.textContent = 'Выберите файл с расширением .csv';
+                csvInput.value = '';
+                return;
+            }
+            try {
+                const content = (await file.text()).replace(/^\uFEFF/, '');
+                const links = extractCSVLinks(content);
+                if (!links.length) throw new Error('В CSV не найдены ссылки. Проверьте столбец URL.');
+                if (links.length > 100) throw new Error(`В файле найдено ${links.length} ссылок. Максимум — 100.`);
+                urlInput.value = links.join('\n');
+                hideResult();
+                fileInfo.textContent = `${file.name}: загружено ссылок — ${links.length}`;
+            } catch (error) {
+                fileInfo.textContent = error.message;
+            } finally {
+                csvInput.value = '';
+            }
+        });
+
+        function extractCSVLinks(csv) {
+            const firstLine = (csv.split(/\r?\n/, 1)[0] || '');
+            const counts = [',', ';', '\t'].map(delimiter => {
+                let count = 0, quoted = false;
+                for (const ch of firstLine) {
+                    if (ch === '"') quoted = !quoted;
+                    else if (ch === delimiter && !quoted) count++;
+                }
+                return count;
+            });
+            const delimiter = [',', ';', '\t'][counts.indexOf(Math.max(...counts))];
+            const rows = []; let row = [], cell = '', quoted = false;
+            for (let i = 0; i < csv.length; i++) {
+                const ch = csv[i];
+                if (ch === '"') {
+                    if (quoted && csv[i + 1] === '"') { cell += '"'; i++; }
+                    else quoted = !quoted;
+                } else if (ch === delimiter && !quoted) { row.push(cell.trim()); cell = ''; }
+                else if ((ch === '\n' || ch === '\r') && !quoted) {
+                    if (ch === '\r' && csv[i + 1] === '\n') i++;
+                    row.push(cell.trim());
+                    if (row.some(value => value)) rows.push(row);
+                    row = []; cell = '';
+                } else cell += ch;
+            }
+            row.push(cell.trim()); if (row.some(value => value)) rows.push(row);
+            if (!rows.length) return [];
+            const header = rows[0].map(value => value.toLowerCase().replace(/^\uFEFF/, ''));
+            const urlColumn = header.findIndex(value => /^(url|link|ссылка|ссылки|адрес|website|сайт)$/.test(value));
+            const hasHeader = urlColumn >= 0;
+            const column = hasHeader ? urlColumn : 0;
+            const values = rows.slice(hasHeader ? 1 : 0).map(r => (r[column] || '').trim())
+                .filter(value => /^(https?:\/\/|www\.)/i.test(value));
+            return [...new Set(values)];
+        }
 
         const REQUEST_TIMEOUT_MS = 6000;   // /api/check укладывается в ~2 с
         const DOMAIN_TIMEOUT_MS  = 15000;  // /api/domain: RDAP + WHOIS до 9 с
@@ -167,6 +263,7 @@
         let runId = 0, baseResult = null, domainCtrl = null;
         let currentSslStatus = '', currentWhoisStatus = '';
         let isCurrentPhish = false, currentUrl = '';
+        let currentRiskScore = 0;
         let isYoungDomain = false;
 
         // Статусы невалидного или неподтверждённого сертификата/домена
@@ -174,19 +271,14 @@
         const BAD_WHOIS_STATUSES = new Set(['not_found', 'unknown', 'limited', 'skipped']);
 
         function updateResultBoxStyle() {
-            const hasWarning = BAD_SSL_STATUSES.has(currentSslStatus) ||
-                               BAD_WHOIS_STATUSES.has(currentWhoisStatus) ||
-                               isYoungDomain;
-
-            if (isCurrentPhish) {
-                resultBox.className = 'result-box danger';
-                resultTitle.textContent = '⚠️ Обнаружен высокий риск фишинга: ' + currentUrl;
-            } else if (hasWarning) {
-                resultBox.className = 'result-box warn';
-                resultTitle.textContent = '⚠️ Результат для: ' + currentUrl;
+            const scoreClass = currentRiskScore < 45 ? 'safe' : (currentRiskScore <= 65 ? 'warn' : 'danger');
+            resultBox.className = 'result-box ' + scoreClass;
+            if (scoreClass === 'danger') {
+                resultTitle.textContent = '⚠️ Высокий риск: ' + currentUrl;
+            } else if (scoreClass === 'warn') {
+                resultTitle.textContent = '⚠️ Умеренный риск: ' + currentUrl;
             } else {
-                resultBox.className = 'result-box safe';
-                resultTitle.textContent = '✅ Результат для: ' + currentUrl;
+                resultTitle.textContent = '✅ Низкий риск: ' + currentUrl;
             }
         }
 
@@ -352,7 +444,7 @@
             }
 
             const score = Math.max(0, Math.min(100, Number(data.score) || 0));
-            card.className = 'batch-card ' + (data.is_phish ? 'danger' : (score > 0 ? 'warn' : 'safe'));
+            card.className = 'batch-card ' + (score < 45 ? 'safe' : (score <= 65 ? 'warn' : 'danger'));
             const status = document.createElement('div');
             status.className = 'batch-score';
             status.textContent = `${data.is_phish ? '⚠️ Возможный фишинг' : 'Риск не превышает порог'} · ${score}/100`;
@@ -555,6 +647,7 @@
             currentUrl = data.url;
 
             const score = Math.max(0, Math.min(100, Number(data.score) || 0));
+            currentRiskScore = score;
             resultScore.textContent = `Оценка риска: ${score} / 100`;
             scoreFill.style.width = score + '%';
 
@@ -738,6 +831,7 @@
             if (addScore === 0 && extraReasons.length === 0) return;
 
             const totalScore = Math.max(0, Math.min(100, (Number(baseResult.score) || 0) + addScore));
+            currentRiskScore = totalScore;
             isCurrentPhish = baseResult.is_phish || totalScore >= PHISH_THRESHOLD;
             updateResultBoxStyle();
 
