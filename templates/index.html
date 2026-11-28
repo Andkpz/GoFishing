@@ -102,6 +102,40 @@
         .page-analysis h3, .coverage-analysis h3 { margin: 0 0 10px; color: var(--text); font-size: 14px; }
         .page-analysis p, .coverage-analysis p { color: #626b78; font-size: 13px; line-height: 1.55; }
         .page-analysis ul, .coverage-analysis ul { margin-top: 8px; }
+        /* Расширенная визуализация результатов */
+        .score-hero { display:grid; grid-template-columns: auto 1fr; align-items:center; gap:18px; margin:4px 0 18px; }
+        .score-ring { --score:0%; width:104px; height:104px; display:grid; place-items:center; border-radius:50%; background:conic-gradient(var(--score-color, var(--green)) var(--score), var(--line) 0); position:relative; flex:none; }
+        .score-ring:before { content:''; position:absolute; inset:8px; border-radius:50%; background:var(--surface); }
+        .score-ring-value { position:relative; z-index:1; font-size:25px; font-weight:800; letter-spacing:-.05em; }
+        .score-ring-value small { display:block; font-size:10px; font-weight:600; color:var(--muted); text-align:center; letter-spacing:0; }
+        .score-explain { min-width:0; }
+        .score-level { font-size:18px; font-weight:750; margin-bottom:5px; }
+        .score-caption { color:var(--muted); font-size:12px; line-height:1.5; }
+        .section-heading { margin:18px 0 9px; font-size:13px; font-weight:750; color:var(--text); }
+        .factor-list { display:grid; gap:7px; }
+        .factor-item { padding:9px 11px; border:1px solid var(--line); border-radius:8px; background:var(--surface-soft); font-size:12px; line-height:1.5; }
+        .analysis-timeline { display:grid; grid-template-columns:repeat(auto-fit,minmax(125px,1fr)); gap:8px; }
+        .timeline-step { min-width:0; padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--surface-soft); }
+        .timeline-step strong { display:block; font-size:12px; margin-bottom:4px; }
+        .timeline-step span { color:var(--muted); font-size:11px; line-height:1.4; }
+        .timeline-step[data-state="ok"] { border-color:var(--safe-border); }
+        .timeline-step[data-state="warn"] { border-color:var(--warn-border); }
+        .timeline-step[data-state="bad"] { border-color:var(--danger-border); }
+        .batch-tools { display:flex; flex-wrap:wrap; gap:8px; align-items:center; padding:12px; border:1px solid var(--line); border-radius:10px; background:var(--surface); }
+        .batch-tools input, .batch-tools select { min-height:38px; min-width:150px; flex:1; padding:8px 10px; border:1px solid var(--line); border-radius:7px; color:var(--text); background:var(--surface-soft); font:inherit; font-size:12px; }
+        .batch-tools button { min-height:38px; padding:8px 12px; font-size:12px; }
+        .batch-stats { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:8px; margin:10px 0; }
+        .batch-stat { padding:10px; border:1px solid var(--line); border-radius:8px; background:var(--surface); }
+        .batch-stat strong { display:block; font-size:19px; }
+        .batch-stat span { color:var(--muted); font-size:11px; }
+        .batch-card[hidden] { display:none; }
+        .batch-card .score-bar { margin:9px 0 12px; }
+        .batch-card details { margin-top:10px; }
+        .batch-card summary { color:var(--accent); cursor:pointer; font-size:12px; font-weight:650; }
+        .result-box.safe .score-ring { --score-color:var(--green); }
+        .result-box.warn .score-ring { --score-color:var(--yellow); }
+        .result-box.danger .score-ring { --score-color:var(--red); }
+        @media (max-width:600px) { .score-hero { grid-template-columns:86px 1fr; gap:12px; } .score-ring { width:86px; height:86px; } .score-ring-value { font-size:21px; } .batch-stats { grid-template-columns:repeat(2,minmax(0,1fr)); } }
         @media (max-width: 600px) {
             body { padding: 42px 14px 56px; }
             .search-box { padding: 12px; }
@@ -156,9 +190,16 @@
 
         <div id="resultBox" class="result-box" aria-live="polite">
             <div class="result-title" id="resultTitle"></div>
+            <div class="score-hero">
+                <div class="score-ring" id="scoreRing"><div class="score-ring-value" id="scoreRingValue">0<small>/ 100</small></div></div>
+                <div class="score-explain"><div class="score-level" id="scoreLevel">Оценка риска</div><div class="score-caption" id="scoreCaption">Оценка формируется по совокупности доступных проверок.</div></div>
+            </div>
             <div class="score" id="resultScore"></div>
             <div class="score-bar"><div class="score-fill" id="scoreFill"></div></div>
-            <ul id="resultReasons"></ul>
+            <div class="section-heading">Что повлияло на результат</div>
+            <div class="factor-list" id="resultReasons"></div>
+            <div class="section-heading">Этапы проверки</div>
+            <div class="analysis-timeline" id="analysisTimeline"></div>
             <div id="incompleteNote" class="incomplete"></div>
             <div id="sslBox" class="ssl-box"></div>
             <div id="whoisBox" class="ssl-box"></div>
@@ -174,6 +215,11 @@
         const resultScore    = document.getElementById('resultScore');
         const scoreFill      = document.getElementById('scoreFill');
         const resultReasons  = document.getElementById('resultReasons');
+        const scoreRing = document.getElementById('scoreRing');
+        const scoreRingValue = document.getElementById('scoreRingValue');
+        const scoreLevel = document.getElementById('scoreLevel');
+        const scoreCaption = document.getElementById('scoreCaption');
+        const analysisTimeline = document.getElementById('analysisTimeline');
         const sslBox         = document.getElementById('sslBox');
         const whoisBox       = document.getElementById('whoisBox');
         const incompleteNote = document.getElementById('incompleteNote');
@@ -273,6 +319,10 @@
         function updateResultBoxStyle() {
             const scoreClass = currentRiskScore < 45 ? 'safe' : (currentRiskScore <= 65 ? 'warn' : 'danger');
             resultBox.className = 'result-box ' + scoreClass;
+            scoreRing.style.setProperty('--score', currentRiskScore + '%');
+            scoreRingValue.replaceChildren(document.createTextNode(String(currentRiskScore))); const small=document.createElement('small'); small.textContent='/ 100'; scoreRingValue.appendChild(small);
+            scoreLevel.textContent = scoreClass === 'danger' ? 'Высокий риск' : scoreClass === 'warn' ? 'Умеренный риск' : 'Низкий риск';
+            scoreCaption.textContent = scoreClass === 'danger' ? 'Обнаружено достаточно признаков для повышенной осторожности.' : scoreClass === 'warn' ? 'Есть признаки, которые стоит проверить вручную.' : 'Сильных подозрительных признаков не выявлено; это не гарантия безопасности.';
             if (scoreClass === 'danger') {
                 resultTitle.textContent = '⚠️ Высокий риск: ' + currentUrl;
             } else if (scoreClass === 'warn') {
@@ -319,6 +369,7 @@
             resultBox.style.display = 'none';
             batchResults.replaceChildren();
             resultReasons.replaceChildren();
+            analysisTimeline.replaceChildren();
             sslBox.replaceChildren();
             sslBox.style.display = 'none';
             whoisBox.replaceChildren();
@@ -398,33 +449,66 @@
             }
         }
 
+        let currentBatchResults = [];
         function renderBatchResults(results) {
-            const summary = document.createElement('div');
-            summary.className = 'batch-summary';
-            batchResults.appendChild(summary);
-
-            const cards = results.map(data => {
-                const card = document.createElement('section');
-                card.className = 'batch-card';
-                batchResults.appendChild(card);
-                renderBatchCard(card, data);
-                return card;
+            currentBatchResults = results;
+            const tools = document.createElement('div');
+            tools.className = 'batch-tools';
+            const search = document.createElement('input');
+            search.type = 'search'; search.placeholder = 'Поиск по URL или причине'; search.setAttribute('aria-label','Поиск результатов');
+            const filter = document.createElement('select');
+            filter.setAttribute('aria-label','Фильтр по уровню риска');
+            [['all','Все результаты'],['safe','Низкий риск'],['warn','Умеренный риск'],['danger','Высокий риск'],['error','Ошибки']].forEach(([value,label]) => {
+                const option = document.createElement('option'); option.value=value; option.textContent=label; filter.appendChild(option);
             });
+            const exportBtn = document.createElement('button'); exportBtn.type='button'; exportBtn.textContent='Экспорт CSV';
+            exportBtn.addEventListener('click', () => exportBatchCSV(currentBatchResults));
+            tools.append(search, filter, exportBtn); batchResults.appendChild(tools);
 
-            updateBatchSummary(results, summary, true);
-            return { cards, summary };
+            const stats = document.createElement('div'); stats.className='batch-stats'; batchResults.appendChild(stats);
+            const summary = document.createElement('div'); summary.className = 'batch-summary'; batchResults.appendChild(summary);
+            const cards = results.map(data => {
+                const card = document.createElement('section'); card.className = 'batch-card';
+                batchResults.appendChild(card); renderBatchCard(card, data); return card;
+            });
+            const applyFilter = () => {
+                const q = search.value.trim().toLowerCase(), f=filter.value;
+                cards.forEach((card,i) => {
+                    const data=results[i], score=Math.max(0,Math.min(100,Number(data && data.score)||0));
+                    const level = data && data.error ? 'error' : score<45?'safe':score<=65?'warn':'danger';
+                    const haystack=(card.textContent||'').toLowerCase();
+                    card.hidden = (f!=='all' && f!==level) || (q && !haystack.includes(q));
+                });
+            };
+            search.addEventListener('input',applyFilter); filter.addEventListener('change',applyFilter);
+            updateBatchSummary(results, summary, true); updateBatchStats(results,stats);
+            return { cards, summary, stats };
+        }
+
+        function updateBatchStats(results, container) {
+            const valid=results.filter(x=>x&&!x.error), scores=valid.map(x=>Math.max(0,Math.min(100,Number(x.score)||0)));
+            const values=[['Всего',results.length],['Низкий риск',scores.filter(x=>x<45).length],['Умеренный',scores.filter(x=>x>=45&&x<=65).length],['Высокий риск',scores.filter(x=>x>65).length]];
+            container.replaceChildren(...values.map(([label,value])=>{const box=document.createElement('div');box.className='batch-stat';const n=document.createElement('strong');n.textContent=value;const t=document.createElement('span');t.textContent=label;box.append(n,t);return box;}));
+        }
+
+        function exportBatchCSV(results) {
+            const quote = value => '"' + String(value ?? '').replace(/"/g,'""') + '"';
+            const rows=[['URL','Оценка риска','Уровень','Флаг фишинга','Причины','Ошибка']];
+            results.forEach(item=>{
+                const score=item&&!item.error?Math.max(0,Math.min(100,Number(item.score)||0)):'';
+                const level=item&&item.error?'Ошибка':score===''?'':score<45?'Низкий':score<=65?'Умеренный':'Высокий';
+                rows.push([item&&item.url||'',score,level,item&&item.is_phish?'Да':'Нет',(item&&Array.isArray(item.reasons)?item.reasons:[]).join('; '),item&&item.error||item&&item.domain_check_error||'']);
+            });
+            const blob=new Blob(['\uFEFF'+rows.map(row=>row.map(quote).join(';')).join('\r\n')],{type:'text/csv;charset=utf-8'});
+            const url=URL.createObjectURL(blob),a=document.createElement('a');a.href=url;a.download='phishdetector-results.csv';document.body.appendChild(a);a.click();a.remove();URL.revokeObjectURL(url);
         }
 
         function updateBatchSummary(results, summary, checkingWhois = false) {
             const failed = results.filter(item => !item || item.error).length;
             const checked = results.length - failed;
             const phishing = results.filter(item => item && !item.error && item.is_phish).length;
-            const incomplete = results.filter(item => {
-                if (!item || item.error || item.whois_status !== 'pending') return false;
-                const status = item.domainInfo && item.domainInfo.status;
-                return !status || ['unknown', 'limited', 'skipped'].includes(status) || Boolean(item.domain_check_error);
-            }).length;
-            summary.textContent = `Проверено: ${checked} из ${results.length} · Высокий риск: ${phishing} · Ошибок: ${failed}` +
+            const incomplete = results.filter(item => item && !item.error && item.whois_status === 'pending' && (!item.domainInfo || ['unknown','limited','skipped'].includes(item.domainInfo.status) || item.domain_check_error)).length;
+            summary.textContent = `Проверено: ${checked} из ${results.length} · Флаг фишинга: ${phishing} · Ошибок: ${failed}` +
                 (checkingWhois ? ' · Уточнение возраста доменов...' : (incomplete ? ` · WHOIS не завершён: ${incomplete}` : ''));
         }
 
@@ -449,6 +533,7 @@
             status.className = 'batch-score';
             status.textContent = `${data.is_phish ? '⚠️ Возможный фишинг' : 'Риск не превышает порог'} · ${score}/100`;
             card.appendChild(status);
+            const bar=document.createElement('div');bar.className='score-bar';const fill=document.createElement('div');fill.className='score-fill';fill.style.width=score+'%';bar.appendChild(fill);card.appendChild(bar);
 
             if (data.domain) {
                 const domain = document.createElement('div');
@@ -502,13 +587,8 @@
             const coverageDetails = buildCoverageDetails(data.analysis_coverage);
             if (coverageDetails) card.appendChild(coverageDetails);
 
-            if (data.redirects && data.redirects.chain && data.redirects.chain.length > 1) {
-                const redirect = document.createElement('div');
-                redirect.style.marginTop = '8px';
-                redirect.textContent = 'Конечный адрес после перенаправлений: ' +
-                    (data.redirects.final_url || data.redirects.chain[data.redirects.chain.length - 1]);
-                card.appendChild(redirect);
-            }
+            const redirectDetails = buildRedirectDetails(data.redirects);
+            if (redirectDetails) card.appendChild(redirectDetails);
             if (data.ssl_status) {
                 const ssl = document.createElement('div');
                 ssl.style.marginTop = '6px';
@@ -555,12 +635,24 @@
                     if (run === runId) {
                         renderBatchCard(batchView.cards[index], data);
                         updateBatchSummary(results, batchView.summary, true);
+                        updateBatchStats(results, batchView.stats);
                     }
                 }
             };
 
             await Promise.all(Array.from({ length: Math.min(4, results.length) }, worker));
-            if (run === runId) updateBatchSummary(results, batchView.summary, false);
+            if (run === runId) { updateBatchSummary(results, batchView.summary, false); updateBatchStats(results,batchView.stats); }
+        }
+
+        function buildRedirectDetails(redirects) {
+            if (!redirects || !Array.isArray(redirects.chain) || redirects.chain.length < 2) return null;
+            const box=document.createElement('details'); box.className='page-analysis redirect-analysis';
+            const summary=document.createElement('summary'); summary.textContent=`Цепочка перенаправлений (${redirects.chain.length-1})`;
+            const list=document.createElement('ol'); list.style.marginTop='9px';
+            redirects.chain.forEach((url,index)=>{const item=document.createElement('li');item.textContent=`${index+1}. ${url}`;list.appendChild(item);});
+            box.append(summary,list);
+            if(redirects.final_url){const final=document.createElement('p');final.textContent='Итоговый адрес: '+redirects.final_url;box.appendChild(final);}
+            return box;
         }
 
         function buildPageDetails(page) {
@@ -637,8 +729,15 @@
             resultBox.className = 'result-box danger';
             resultTitle.textContent = 'Ошибка проверки';
             resultScore.textContent = '';
+            currentRiskScore=0; updateResultBoxStyle();
+            resultTitle.textContent = 'Ошибка проверки';
+            scoreLevel.textContent = 'Проверка не завершена';
+            scoreCaption.textContent = 'Оценка риска не рассчитана.';
+            scoreRingValue.replaceChildren(document.createTextNode('—'));
+            const small=document.createElement('small'); small.textContent='/ 100'; scoreRingValue.appendChild(small);
             scoreFill.style.width = '0';
-            resultReasons.replaceChildren(li(message));
+            analysisTimeline.replaceChildren();
+            resultReasons.replaceChildren(factor(message));
             resultBox.style.display = 'block';
         }
 
@@ -654,9 +753,14 @@
             const reasons = (data.reasons && data.reasons.length)
                 ? data.reasons
                 : ['Подозрительных признаков не обнаружено.'];
-            resultReasons.replaceChildren(...reasons.map(li));
+            resultReasons.replaceChildren(...reasons.map(factor));
+            renderAnalysisTimeline(data);
 
             renderSSL(data);
+            const oldRedirectDetails = resultBox.querySelector('.redirect-analysis');
+            if (oldRedirectDetails) oldRedirectDetails.remove();
+            const redirectDetails = buildRedirectDetails(data.redirects);
+            if (redirectDetails) resultBox.appendChild(redirectDetails);
             const oldPageDetails = resultBox.querySelector('.page-analysis');
             if (oldPageDetails) oldPageDetails.remove();
             const pageDetails = buildPageDetails(data.page);
@@ -758,11 +862,13 @@
                 const info = await resp.json();
                 if (run !== runId || !baseResult) return;
                 renderWhois(info);
+                renderAnalysisTimeline({ ...baseResult, domainInfo: info });
                 applyDomainScore(info);
             } catch (err) {
                 if (run !== runId || !baseResult) return;
-                renderWhois({ status: 'unknown',
-                    detail: err.name === 'AbortError' ? 'таймаут 15 с' : err.message });
+                const failedInfo = { status: 'unknown', detail: err.name === 'AbortError' ? 'таймаут 15 с' : err.message };
+                renderWhois(failedInfo);
+                renderAnalysisTimeline({ ...baseResult, domainInfo: failedInfo });
             } finally {
                 clearTimeout(timer);
             }
@@ -840,9 +946,25 @@
 
             const baseReasons = (baseResult.reasons && baseResult.reasons.length) ? baseResult.reasons : [];
             const allReasons = [...baseReasons, ...extraReasons];
-            if (allReasons.length) {
-                resultReasons.replaceChildren(...allReasons.map(li));
-            }
+            if (allReasons.length) resultReasons.replaceChildren(...allReasons.map(factor));
+        }
+
+        function factor(text) {
+            const item=document.createElement('div'); item.className='factor-item'; item.textContent=String(text); return item;
+        }
+
+        function renderAnalysisTimeline(data) {
+            const steps=[];
+            steps.push({name:'URL-анализ',detail:'Лексические признаки и структура адреса',state:'ok'});
+            const chain=data.redirects&&Array.isArray(data.redirects.chain)?data.redirects.chain:[];
+            steps.push({name:'Перенаправления',detail:chain.length>1?`${chain.length-1} переход(а) обнаружено`:'Переходы не зафиксированы',state:chain.length>1?'warn':'ok'});
+            const ssl=data.ssl_status||(data.ssl&&data.ssl.status)||'';
+            steps.push({name:'SSL / TLS',detail:ssl?((SSL_VIEW[ssl]&&SSL_VIEW[ssl].title)||ssl):'Нет данных',state:ssl==='ok'?'ok':(['invalid','no_tls','no_dns'].includes(ssl)?'warn':'muted')});
+            const whois=data.domainInfo;
+            steps.push({name:'WHOIS / RDAP',detail:whois?(whois.created?'Данные о регистрации получены':(whois.status||'Ответ получен')):(data.whois_status==='pending'?'Ожидает уточнения':'Нет данных'),state:whois&&whois.status==='ok'?'ok':whois?'warn':'muted'});
+            const page=data.page||{};
+            steps.push({name:'HTML-парсер',detail:page.status==='ok'?'Страница разобрана':(page.status||'Нет данных'),state:page.status==='ok'?'ok':page.status==='unavailable'||page.status==='http_error'?'warn':'muted'});
+            analysisTimeline.replaceChildren(...steps.map(step=>{const box=document.createElement('div');box.className='timeline-step';box.dataset.state=step.state;const title=document.createElement('strong');title.textContent=step.name;const detail=document.createElement('span');detail.textContent=step.detail;box.append(title,detail);return box;}));
         }
 
         function fmtDate(val) {
